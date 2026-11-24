@@ -948,11 +948,13 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn desc(this: This, out: *mut QueueDesc) -> *mut QueueDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(queue(this).desc) };
     }
+    out
 }
 
 /// The queue methods by their slot in older titles' queues (the 2020-era
@@ -1017,6 +1019,41 @@ mod tests {
         } else {
             0x70
         }
+    }
+
+    fn desc_slot(q: This) -> usize {
+        // SAFETY: one of our queues; its first field is the table.
+        let table = unsafe { *q.cast::<*const *const ()>() };
+        if table == NEWER_FUNCTIONS.0.as_ptr() {
+            0xe0
+        } else {
+            0xd0
+        }
+    }
+
+    #[test]
+    fn queue_get_desc_returns_its_output_pointer() {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 2,
+            priority: 100,
+            flags: 1,
+            nodes: 1,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut out = std::mem::MaybeUninit::<QueueDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut QueueDesc) -> *mut QueueDesc;
+        let get_desc = slot::<GetDesc>(q, desc_slot(q));
+        assert_eq!(get_desc(q, out.as_mut_ptr()), out.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { out.assume_init() };
+        assert_eq!(
+            (read.kind, read.priority, read.flags, read.nodes),
+            (desc.kind, desc.priority, desc.flags, desc.nodes)
+        );
+        assert!(get_desc(q, std::ptr::null_mut()).is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
     #[test]
