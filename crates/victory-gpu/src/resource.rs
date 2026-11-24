@@ -606,8 +606,17 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear twins: 8-bit color, then BC1, BC2, BC3
+/// and BC7.
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28),
+    (91, 87),
+    (93, 88),
+    (72, 71),
+    (75, 74),
+    (78, 77),
+    (99, 98),
+];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -2503,6 +2512,209 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    /// The title may view a texture as sRGB or linear whichever format it
+    /// made it in, as the console allows: a shader reads 0x80 as 0.216
+    /// through the sRGB view, 0.502 through the linear one, and in the
+    /// texture's own format through a view without a description.
+    #[cfg(windows)]
+    #[test]
+    fn srgb_and_linear_views_of_one_texture_read_their_own_curve() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::core::s;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u0)"
+Texture2D<float4> as_srgb : register(t0);
+Texture2D<float4> as_linear : register(t1);
+Texture2D<float4> as_own : register(t2);
+RWByteAddressBuffer reads : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    int3 at = int3(1, 2, 0);
+    float3 r = float3(as_srgb.Load(at).r, as_linear.Load(at).r, as_own.Load(at).r);
+    reads.Store3(0, asuint(r));
+}
+"#;
+        let mut blob: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; the out
+        // pointer is ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("views"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut blob,
+                None,
+            )
+            .unwrap()
+        };
+        let blob = blob.unwrap();
+        // SAFETY: the blob's own bytes.
+        let code = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        };
+        // SAFETY: plain object creation; the root signature is inside the
+        // shader.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, code).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pso)
+        };
+        let host_buffer = |kind: D3D12_HEAP_TYPE, flags, state| {
+            let mut b: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            // SAFETY: plain creation of a buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap()
+            };
+            b.unwrap()
+        };
+        // The texture made in `own`, its memory filled with `block`: what
+        // the shader reads through the title's views in `views` (sRGB,
+        // linear) and through one without a description.
+        let read = |own: u32, views: [u32; 2], block: &[u8]| -> [f32; 3] {
+            let null = std::ptr::null();
+            let mut image = null;
+            let desc = texture(4, 4, own, 1);
+            let iid = &RESOURCE_IIDS[0];
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut image),
+                S_OK
+            );
+            // Every element alike, so the layout does not matter.
+            let size = footprint(&desc).unwrap().size as usize;
+            // SAFETY: the texture's memory, `size` bytes.
+            let memory = unsafe { std::slice::from_raw_parts_mut(resource(image).data(), size) };
+            for (i, b) in memory.iter_mut().enumerate() {
+                *b = block[i % block.len()];
+            }
+            let mut slots = [0u64; 3 * 4];
+            let base = slots.as_mut_ptr() as u64;
+            let at = |i: u32| base + 32 * u64::from(i);
+            // 2D, the default component mapping, one mip.
+            let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            let srv = |format| [format, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
+            crate::descriptor::create_srv(null, image, &srv(views[0]), at(0));
+            crate::descriptor::create_srv(null, image, &srv(views[1]), at(1));
+            crate::descriptor::create_srv(null, image, null.cast(), at(2));
+            let heap = crate::descriptor::host::HostHeap::new(false, 3).unwrap();
+            for i in 0..3 {
+                assert!(heap.mirror(i, at(i), true).is_some());
+            }
+            let out = host_buffer(
+                D3D12_HEAP_TYPE_DEFAULT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            );
+            let back = host_buffer(
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            let list = host.new_list().unwrap();
+            crate::texture::upload(&list, image, host_resource(image).unwrap());
+            const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+            crate::list::ensure_state(&list, image, NON_PIXEL_SHADER_RESOURCE);
+            // SAFETY: an open list; our pipeline, heap and live resources.
+            unsafe {
+                let l = &list.list;
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                l.SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
+                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                l.Dispatch(1, 1, 1);
+                l.ResourceBarrier(&[crate::host::transition(
+                    &out,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                l.CopyBufferRegion(&back, 0, &out, 0, 12);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits); it wrote 12 bytes.
+            let read = unsafe {
+                let range = D3D12_RANGE { Begin: 0, End: 12 };
+                back.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                mapped.cast::<[f32; 3]>().read_unaligned()
+            };
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            read
+        };
+        let to_linear = |c: f32| ((c + 0.055) / 1.055).powf(2.4);
+        // 0x80 in every channel of 8-bit color; a BC1 block of one color,
+        // red 16 of 31 (132 of 255 when expanded to 8 bits first).
+        const RGBA: &[u8] = &[0x80];
+        const BC1: &[u8] = &[0x00, 0x80, 0x00, 0x80, 0, 0, 0, 0];
+        let cases = [
+            (28, 29, 128.0 / 255.0, 0.002f32, RGBA),
+            (87, 91, 128.0 / 255.0, 0.002, RGBA),
+            (71, 72, 16.0 / 31.0, 0.01, BC1),
+        ];
+        let mut wrong = Vec::new();
+        for (linear, srgb, unorm, near, block) in cases {
+            for own in [linear, srgb] {
+                let curve = to_linear(unorm);
+                let wanted = [curve, unorm, if own == srgb { curve } else { unorm }];
+                let got = read(own, [srgb, linear], block);
+                if got.iter().zip(wanted).any(|(g, w)| (g - w).abs() > near) {
+                    wrong.push(format!(
+                        "texture {own}, views {srgb}/{linear}/none: read {got:?}, wanted {wanted:?}"
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
