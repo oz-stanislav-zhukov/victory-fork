@@ -158,6 +158,19 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
     }
 }
 
+/// A `connect` target that reaches no one: an address of zeros (or of no
+/// family), which disconnects a datagram socket from its peer, and which a
+/// stream socket cannot connect to. Passed to the host; it never leaves
+/// the machine.
+fn no_peer(addr: *const u8, len: i32) -> bool {
+    if addr.is_null() || len < 2 {
+        return false;
+    }
+    // SAFETY: the title passes `len` (at least 2) readable bytes.
+    let family = unsafe { std::slice::from_raw_parts(addr, 2) };
+    family == [0, 0] || socket_addr(addr, len).is_some_and(|a| a.ip().is_unspecified())
+}
+
 /// Connecting by name: only to loopback. A name would need a lookup
 /// (`WSAHOST_NOT_FOUND`), an address a route (`WSAENETUNREACH`).
 fn reachable_name(name: Option<String>) -> bool {
@@ -224,7 +237,7 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
 // Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !no_peer(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32)(s, name, len)
@@ -239,7 +252,7 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !no_peer(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)(
@@ -936,6 +949,47 @@ mod tests {
     // TEST-NET-1 (192.0.2.0/24): never routed, and never tried here.
     const AWAY: [u8; 4] = [192, 0, 2, 1];
     const HOME: [u8; 4] = [127, 0, 0, 1];
+
+    /// A datagram socket connected to a peer is disconnected by connecting
+    /// it to an address of zeros, as Winsock documents; that address reaches
+    /// no one, so it is not refused as off the machine (#891).
+    #[test]
+    fn a_zero_address_disconnects_a_datagram_socket() {
+        // Also starts Winsock for the raw calls below.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        type GetPeerName = extern "system" fn(Socket, *mut u8, *mut i32) -> i32;
+        let getpeername = host!("ws2_32.dll", "getpeername": GetPeerName);
+        let connected = |s: Socket| {
+            let mut addr = [0u8; 16];
+            let mut len = 16;
+            getpeername(s, addr.as_mut_ptr(), &mut len) == 0
+        };
+        const WSAENOTCONN: i32 = 10057;
+        let null = std::ptr::null_mut::<c_void>();
+
+        let u = socket(2, 2, 17);
+        assert_ne!(u, INVALID_SOCKET);
+        for zero in [v4([0; 4], 0), [0u8; 16]] {
+            assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+            assert!(connected(u));
+            // An IPv4 address of zeros, and a sockaddr of no family.
+            assert_eq!(connect(u, zero.as_ptr(), 16), 0, "{zero:?}");
+            assert!(!connected(u));
+            assert_eq!(last_error(), WSAENOTCONN);
+        }
+        assert_eq!(connect(u, v4(HOME, port).as_ptr(), 16), 0);
+        let n = null.cast_const();
+        assert_eq!(WSAConnect(u, v4([0; 4], 0).as_ptr(), 16, n, null, n, n), 0);
+        assert!(!connected(u));
+        // A real address off the machine is still refused.
+        assert_eq!(connect(u, v4(AWAY, 80).as_ptr(), 16), SOCKET_ERROR);
+        assert_eq!(last_error(), WSAENETUNREACH);
+        close(u);
+    }
 
     #[test]
     fn only_loopback_is_reachable() {
