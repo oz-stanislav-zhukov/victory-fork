@@ -17,6 +17,7 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -967,12 +968,12 @@ extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 extern "system" fn reading_release(this: *const Reading) -> u32 {
-    let left = reading(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if left == 0 {
+    let left = release_ref(&reading(this).refs, "input reading");
+    if left == Some(0) {
         // SAFETY: the last reference is gone; `Ref::new` boxed it.
         drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
-    left
+    left.unwrap_or(0)
 }
 extern "system" fn input_kind(this: *const Reading) -> u32 {
     reading(this).kind()
@@ -1625,5 +1626,24 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    /// A title releasing a reading once too often: the count stays 0 and
+    /// nothing is freed again (the old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn reading_release_past_zero_leaves_the_count_at_zero() {
+        let reading = Box::into_raw(Box::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(0),
+            device: std::ptr::null(),
+            sequence: 0,
+            timestamp: 0,
+            value: Value::Keys(Vec::new()),
+        }));
+        assert_eq!(reading_release(reading), 0);
+        // SAFETY: still allocated: `reading_release` freed nothing.
+        assert_eq!(unsafe { &*reading }.refs.load(Ordering::Relaxed), 0);
+        // SAFETY: boxed above and not freed.
+        drop(unsafe { Box::from_raw(reading) });
     }
 }

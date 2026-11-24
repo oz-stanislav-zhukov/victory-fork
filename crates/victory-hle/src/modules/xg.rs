@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
 
+use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
@@ -280,13 +281,13 @@ extern "system" fn add_ref(this: This) -> u32 {
 }
 
 extern "system" fn release(this: This) -> u32 {
-    let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if left == 0 {
+    let left = release_ref(&computer(this).refs, "texture computer");
+    if left == Some(0) {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
         // last reference is gone.
         drop(unsafe { Box::from_raw(this) });
     }
-    left
+    left.unwrap_or(0)
 }
 
 extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
@@ -776,5 +777,21 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    /// A title releasing a computer once too often: the count stays 0 and
+    /// nothing is freed again (the old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn release_past_zero_leaves_the_count_at_zero() {
+        let c = create(&desc(128, 4, 1, 11, 0x100));
+        let release = slot::<extern "system" fn(This) -> u32>(c, 1);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(c, 0)(c), 2);
+        assert_eq!(release(c), 1);
+        computer(c).refs.store(0, Ordering::Relaxed);
+        assert_eq!(release(c), 0);
+        assert_eq!(computer(c).refs.load(Ordering::Relaxed), 0);
+        // SAFETY: made by `XGCreateTextureComputer` and not freed by
+        // `release`.
+        drop(unsafe { Box::from_raw(c) });
     }
 }

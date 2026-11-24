@@ -42,7 +42,22 @@ pub mod xstore;
 pub mod xsystem;
 pub mod xuser;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::HleModule;
+
+/// Takes one reference off a COM count: the count left, or `None` when
+/// none was left (the title released once too often). Then the count
+/// stays 0 and the caller frees nothing a second time.
+pub(crate) fn release_ref(refs: &AtomicU32, object: &'static str) -> Option<u32> {
+    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
+        Ok(n) => Some(n - 1),
+        Err(_) => {
+            tracing::warn!(object, "released with no references left");
+            None
+        }
+    }
+}
 
 pub(crate) fn all() -> Vec<HleModule> {
     let mut all = vec![

@@ -27,6 +27,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
 
+use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
@@ -89,12 +90,12 @@ extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
     // SAFETY: as above.
-    let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
-    if left == 0 {
+    let left = release_ref(&unsafe { &*this }.refs, "dstorage object");
+    if left == Some(0) {
         // SAFETY: the last reference; created by `Instance::create`.
         drop(unsafe { Box::from_raw(this) });
     }
-    left
+    left.unwrap_or(0)
 }
 
 fn iid_text(iid: *const Guid) -> String {
@@ -1551,5 +1552,22 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A title releasing once too often: the count stays 0 and nothing is
+    /// freed again (the old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn release_past_zero_leaves_the_count_at_zero() {
+        let object = Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), ())
+            .cast::<Instance<()>>();
+        assert_eq!(add_ref_instance(object), 2);
+        assert_eq!(release(object), 1);
+        // SAFETY: still allocated; the test holds the object.
+        let refs = &unsafe { &*object }.refs;
+        refs.store(0, Ordering::Relaxed);
+        assert_eq!(release(object), 0);
+        assert_eq!(refs.load(Ordering::Relaxed), 0);
+        // SAFETY: made by `Instance::create` and not freed by `release`.
+        drop(unsafe { Box::from_raw(object) });
     }
 }

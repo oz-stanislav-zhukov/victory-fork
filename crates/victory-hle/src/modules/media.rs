@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use super::files;
+use super::release_ref;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
 
@@ -273,8 +274,8 @@ extern "system" fn add_ref(this: *mut Resolver) -> u32 {
 
 extern "system" fn release(this: *mut Resolver) -> u32 {
     // SAFETY: as in `host`.
-    let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
-    if left == 0 {
+    let left = release_ref(unsafe { &(*this).refs }, "source resolver");
+    if left == Some(0) {
         // SAFETY: made by `MFCreateSourceResolver`; this was the last
         // reference, to the proxy and to the host object it holds.
         let proxy = unsafe { Box::from_raw(this) };
@@ -282,7 +283,7 @@ extern "system" fn release(this: *mut Resolver) -> u32 {
         let release: extern "system" fn(*mut Host) -> u32 = unsafe { Host::method(proxy.host, 2) };
         release(proxy.host);
     }
-    left
+    left.unwrap_or(0)
 }
 
 extern "system" fn create_from_url(
@@ -527,5 +528,23 @@ mod tests {
     fn interface_ids_are_the_resolvers() {
         assert_eq!(&IID_IUNKNOWN[8..], &[0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
         assert_eq!(&IID_RESOLVER[..4], &[0x2D, 0xA3, 0xE5, 0xFB]);
+    }
+
+    /// A title releasing the resolver once too often: the count stays 0,
+    /// and neither the proxy nor the host object is released again (the
+    /// old `fetch_sub(1) - 1` overflowed).
+    #[test]
+    fn release_past_zero_leaves_the_count_at_zero() {
+        // No host object: `release` must not reach it at a count of 0.
+        let resolver = Box::into_raw(Box::new(Resolver {
+            vtable: &METHODS,
+            host: std::ptr::null_mut(),
+            refs: AtomicU32::new(0),
+        }));
+        assert_eq!(release(resolver), 0);
+        // SAFETY: still allocated: `release` freed nothing.
+        assert_eq!(unsafe { &*resolver }.refs.load(Ordering::Relaxed), 0);
+        // SAFETY: boxed above and not freed.
+        drop(unsafe { Box::from_raw(resolver) });
     }
 }
