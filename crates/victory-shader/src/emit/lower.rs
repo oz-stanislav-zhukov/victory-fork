@@ -8576,6 +8576,10 @@ impl<'a> Lower<'a> {
                 }
             }
             "u64" | "i64" => {
+                if matches!(op, "f" | "t") {
+                    self.lane(inst, Some(op == "t"));
+                    return Ok(());
+                }
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";
                 let p = match op {
@@ -11621,5 +11625,60 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn constant_64_bit_compares_lower_without_int64() {
+        for (vopc, branch) in [
+            (0x7DC0_0080u32, 0xBF86_0001u32), // v_cmp_f_u64 vcc, ...; s_cbranch_vccnz
+            (0x7D4E_0080, 0xBF86_0001),       // v_cmp_t_i64 vcc, ...; s_cbranch_vccnz
+            (0x7DE0_0080, 0xBF89_0001),       // v_cmpx_f_u64 exec, ...; s_cbranch_execnz
+            (0x7D6E_0080, 0xBF89_0001),       // v_cmpx_t_i64 exec, ...; s_cbranch_execnz
+        ] {
+            let words = [
+                0x7E00_0280u32, // v_mov_b32 v0, 0
+                0x7E02_0280,    // v_mov_b32 v1, 0
+                vopc,
+                branch,
+                0xBE80_0380, // s_mov_b32 s0, 0
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 2,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 2).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let emitted = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            let sfi0 = crate::dxbc::Container::parse(&emitted.dxil)
+                .unwrap()
+                .part(crate::dxbc::FourCC::SFI0)
+                .unwrap()
+                .data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "unexpected INT64 feature bit");
+        }
     }
 }
