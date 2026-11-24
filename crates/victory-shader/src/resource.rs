@@ -82,9 +82,13 @@ pub enum Source {
     /// descriptor that differs between lanes.
     Fetched { load: Site, first: u8 },
     /// Picked per lane by `v_cndmask_b32` reading the lane mask whose low
-    /// dword is `mask`: the source where the lane's bit is set, then where it
-    /// is clear.
-    Lanes { mask: Value, args: Vec<Source> },
+    /// dword is `mask` (and, in wave64, whose high dword is `high`): the
+    /// source where the lane's bit is set, then where it is clear.
+    Lanes {
+        mask: Value,
+        high: Option<Value>,
+        args: Vec<Source>,
+    },
     /// Per-lane dwords chosen by control flow (VGPRs joined where lanes
     /// that took different paths meet): one source per predecessor of
     /// `block`, in [`crate::ir::Block::preds`] order, `None` on an edge no
@@ -1750,7 +1754,8 @@ impl<'a> Tracer<'a> {
         }
         joins.push(usize::MAX);
         // Each side holds where the lane's bit of the mask is set, or clear.
-        let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
+        // The exact pair: in wave64 either dword may have changed alone.
+        let bit = self.lanes.and_then(|l| l.mask_bits(mask.0, mask.1));
         let side = |set: bool| -> Vec<Term> {
             words
                 .iter()
@@ -1778,13 +1783,17 @@ impl<'a> Tracer<'a> {
             })
             .collect::<Result<_, _>>();
         joins.pop();
-        Ok(Some(Source::Lanes { mask, args: args? }))
+        Ok(Some(Source::Lanes {
+            mask: mask.0,
+            high: mask.1,
+            args: args?,
+        }))
     }
 
-    /// For `v` written by a plain `v_cndmask_b32`: the low dword of the
-    /// lane mask it reads, and the dword it is where the lane's bit is set
-    /// (src1), then clear (src0).
-    fn lane_picked(&self, v: Value) -> Option<(Value, Term, Term)> {
+    /// For `v` written by a plain `v_cndmask_b32`: the lane mask it reads
+    /// (its low dword, and in wave64 its high one), and the dword it is
+    /// where the lane's bit is set (src1), then clear (src0).
+    fn lane_picked(&self, v: Value) -> Option<((Value, Option<Value>), Term, Term)> {
         let inst = self.def(v)?;
         let Fields::Valu(f) = &inst.fields else {
             return None;
@@ -1807,7 +1816,12 @@ impl<'a> Tracer<'a> {
             return None;
         };
         let mask = inst.read(Reg::S(code))?;
-        Some((mask, self.raw(inst, &set)?, self.raw(inst, &clear)?))
+        let high = if self.p.wave64 {
+            Some(inst.read(Reg::S(code.checked_add(1)?))?)
+        } else {
+            None
+        };
+        Some(((mask, high), self.raw(inst, &set)?, self.raw(inst, &clear)?))
     }
 
     /// Per-lane words that phis of one block join, as an if/else on a

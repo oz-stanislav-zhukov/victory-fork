@@ -6329,23 +6329,26 @@ impl<'a> Lower<'a> {
         match src {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
             Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
-            Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
+            Source::Lanes { args, .. } | Source::Select { args, .. } => {
                 let [a, b] = &args[..] else {
                     return Err("a descriptor chosen per lane");
                 };
-                let cond = if matches!(src, Source::Lanes { .. }) {
-                    let &m = self
-                        .x
-                        .st
-                        .masks
-                        .get(mask)
-                        .ok_or("a descriptor chosen per lane by an untracked mask")?;
-                    self.boolean(m, self.cur)?
-                } else {
-                    match self.get(*mask)? {
+                let cond = match src {
+                    // The exact pair: in wave64 either dword may have
+                    // changed alone since the compare.
+                    Source::Lanes { mask, high, .. } => {
+                        let m = self
+                            .x
+                            .st
+                            .mask_bits(*mask, *high)
+                            .ok_or("a descriptor chosen per lane by an untracked mask")?;
+                        self.boolean(m, self.cur)?
+                    }
+                    Source::Select { scc, .. } => match self.get(*scc)? {
                         Val::Bit(x) => x,
                         _ => return Err("SCC without a value"),
-                    }
+                    },
+                    _ => unreachable!(),
                 };
                 let set = self.lane_heap_index(a, sampler)?;
                 let clear = self.lane_heap_index(b, sampler)?;
@@ -11417,6 +11420,35 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    /// A wave64 descriptor picked per lane by `v_cndmask_b32` follows both
+    /// dwords of its mask: with `vcc_hi` cleared after the compare, lanes
+    /// 32-63 take the other descriptor, which the compare alone does not
+    /// say.
+    #[test]
+    fn a_wave64_per_lane_choice_follows_both_halves_of_its_mask() {
+        use crate::resource::tests::{WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32};
+        let at = |w: &[u32], word: u32| w.iter().position(|&x| x == word).unwrap();
+        // The picks of the wave32 program (up to its `s_mov_b32 s20,
+        // exec_lo`), then the wave64 loop (from its `s_mov_b64 s[20:21],
+        // exec`): the same registers.
+        let picks = &WATERFALL_PICKED_WAVE32[..at(WATERFALL_PICKED_WAVE32, 0xBE94_037E)];
+        let tail = &WATERFALL_FETCHED_WAVE64[at(WATERFALL_FETCHED_WAVE64, 0xBE94_047E)..];
+        let whole = [picks, tail].concat();
+        let mut cleared = whole.clone();
+        // s_mov_b32 vcc_hi, 0, after v_cmp_gt_u32 vcc, 16, v0.
+        cleared.insert(at(&whole, 0x7D88_0090) + 1, 0xBEEB_0380);
+        let lower = |w: &[u32]| {
+            let (layout, used) = texture_tables();
+            lower_wave(w, layout, used, true)
+        };
+        let both = lower(&whole).unwrap();
+        assert_eq!(both.nonuniform_handles, 1);
+        // The pair (the compare's low dword, a cleared high one) is no mask
+        // the structure tracks: refused, not traced as the compare's choice.
+        let refused = lower(&cleared).map(|_| ()).unwrap_err();
+        assert!(refused.to_string().contains("untracked mask"), "{refused}");
     }
 
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
