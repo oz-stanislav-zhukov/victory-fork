@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod agility;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,6 +27,15 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Fetch the D3D12 Agility SDK runtime (Microsoft's NuGet package,
+    /// pinned and hash-checked) into `<target>/<profile>/D3D12/` beside
+    /// victory.exe. Needed on Windows 10, whose in-box D3D12 stops at shader
+    /// model 6.5.
+    Agility {
+        /// Cargo's target folder. Default: `CARGO_TARGET_DIR`, else `target`.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -44,6 +54,12 @@ fn main() -> Result<()> {
             );
             println!("hooks installed: commits now run `cargo xtask policy --staged`");
             Ok(())
+        }
+        Cmd::Agility { target_dir } => {
+            let target = target_dir
+                .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+                .unwrap_or_else(|| root.join("target"));
+            agility::run(&target)
         }
     }
 }
