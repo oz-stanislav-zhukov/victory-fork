@@ -326,6 +326,10 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Events waiting for the single delivery loop.
+    queue: VecDeque<Event>,
+    /// One thread drains `queue`; other producers only append.
+    delivering: bool,
 }
 
 pub struct Hub {
@@ -370,6 +374,8 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                queue: VecDeque::new(),
+                delivering: false,
             }),
             returned: Condvar::new(),
         }));
@@ -411,12 +417,32 @@ impl Hub {
         self.deliver(events);
     }
 
-    /// Runs callbacks, never under our lock: they call back into us. One
-    /// unregistered since the event was taken does not run, and
-    /// `UnregisterCallback` waits for one that runs.
+    /// Runs callbacks one at a time, in the order they were queued, never
+    /// under our lock: they call back into us. A callback delivered from a
+    /// callback joins the same queue instead of nesting. One unregistered
+    /// since the event was queued does not run, and `UnregisterCallback`
+    /// waits for one that runs.
     fn deliver(&self, events: Vec<Event>) {
+        {
+            let mut state = self.state();
+            state.queue.extend(events);
+            if state.delivering {
+                return;
+            }
+            state.delivering = true;
+        }
         let me = std::thread::current().id();
-        for e in events {
+        loop {
+            let e = {
+                let mut state = self.state();
+                match state.queue.pop_front() {
+                    Some(e) => e,
+                    None => {
+                        state.delivering = false;
+                        return;
+                    }
+                }
+            };
             let r = e.registration;
             {
                 let mut state = self.state();
@@ -1599,6 +1625,78 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    #[test]
+    fn callbacks_from_registration_and_poll_are_serialized() {
+        use std::sync::atomic::AtomicBool;
+        static ACTIVE: AtomicU32 = AtomicU32::new(0);
+        static PEAK: AtomicU32 = AtomicU32::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn tracked(
+            _: u64,
+            _: *mut c_void,
+            _: *const Device,
+            _: u64,
+            _: u32,
+            _: u32,
+        ) {
+            let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(active, Ordering::SeqCst);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        let (hub, host) = fake();
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        ACTIVE.store(0, Ordering::SeqCst);
+        PEAK.store(0, Ordering::SeqCst);
+        CALLS.store(0, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        // Blocking enumeration delivers its first callback on the registering
+        // thread, which stays inside it while the poll thread runs.
+        let registrar = std::thread::spawn(move || {
+            let mut token = 0;
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(tracked),
+                &mut token,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while ACTIVE.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(ACTIVE.load(Ordering::SeqCst), 0, "registration delivered a callback");
+        let poller = std::thread::spawn(move || {
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1, "only one callback runs");
+        RELEASE.store(true, Ordering::SeqCst);
+        assert_eq!(registrar.join().unwrap(), S_OK);
+        poller.join().unwrap();
+        assert_eq!(PEAK.load(Ordering::SeqCst), 1);
+        assert!(CALLS.load(Ordering::SeqCst) >= 2, "initial and hotplug both ran");
     }
 
     #[test]
