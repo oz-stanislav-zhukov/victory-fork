@@ -10231,7 +10231,9 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // Two f16 channels per source dword: only the pixel color and
+        // depth targets unpack them; the rest stay refused.
+        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -10363,7 +10365,9 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                // Two f16 channels per dword: an odd channel the high half.
+                let half = e.compressed.then_some(ch % 2 == 1);
+                stores.push((id, col, value, half));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
@@ -11101,6 +11105,67 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// Lowers a pixel program with one target: whether it translates.
+    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let target = crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
+        // A compr export: each source dword packs two f16 channels, the
+        // low half first, so four channels come from two VGPRs.
+        let words = [
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xF800_0C0F,
+            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
+            S_ENDPGM,
+        ];
+        lowers_ps(&words).unwrap();
     }
 
     #[test]
