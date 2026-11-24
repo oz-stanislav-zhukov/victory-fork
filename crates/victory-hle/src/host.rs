@@ -44,6 +44,7 @@ impl Default for HostPolicy {
             "ole32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
+            "rpcrt4.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
             "dbghelp.dll",
             // Same APIs as the console's (XAudio2 ordinal 1 is XAudio2Create
@@ -236,5 +237,17 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_policy_allows_rpcrt4() {
+        let policy = HostPolicy::default();
+        assert!(policy.allows("rpcrt4.dll"));
+        assert!(policy.allows("RPCRT4.DLL"));
     }
 }
