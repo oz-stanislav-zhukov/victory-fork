@@ -198,11 +198,7 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
+    let rvas = watch_rvas(&list, size);
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
@@ -217,6 +213,17 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// The RVAs `VICTORY_WATCH` asks for, kept only when four bytes fit in the
+/// image. `rva + 4` would wrap for a large value and pass the check, making
+/// the polling thread read in front of the image base instead.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn watch_rvas(list: &str, size: usize) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
+        .collect()
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
@@ -352,6 +359,14 @@ impl LoaderLock {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn watch_rejects_rvas_that_wrap() {
+        let list = format!("0,{:x}", usize::MAX);
+        assert_eq!(super::watch_rvas(&list, 4), vec![0]);
+        assert_eq!(super::watch_rvas("0x10,1c,20", 0x20), vec![0x10, 0x1c]);
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
