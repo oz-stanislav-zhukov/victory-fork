@@ -129,6 +129,10 @@ fn f32_to_half(v: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
+    if bits & 0x7fff_ffff > 0x7f80_0000 {
+        // NaN stays NaN (quiet, the payload's top bits kept), not infinity.
+        return sign | 0x7e00 | (man >> 13) as u16;
+    }
     if exp >= 31 {
         return sign | 0x7c00; // too large: infinity
     }
@@ -147,10 +151,11 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Rounded to nearest: a carry out of the mantissa is added into the
-    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    // Rounded to nearest, ties to even: a carry out of the mantissa is
+    // added into the exponent (`2 - 2^-12` is 2.0); at most it reaches
+    // infinity, 0x7c00.
     let half = (exp as u32) << 10;
-    sign | (half + ((man + 0x1000) >> 13)) as u16
+    sign | (half + ((man + 0xfff + ((man >> 13) & 1)) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -184,6 +189,26 @@ mod tests {
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x3e00), 1.5);
         assert_eq!(half_to_f32(0xc000), -2.0);
+    }
+
+    /// NaN converts to a half NaN, and a value halfway between two halves
+    /// rounds to the even one, as IEEE 754 and the GPU do (#843).
+    #[test]
+    fn halves_keep_nan_and_round_ties_to_even() {
+        let is_nan = |h: u16| h & 0x7c00 == 0x7c00 && h & 0x3ff != 0;
+        assert!(is_nan(f32_to_half(f32::NAN)));
+        assert_eq!(f32_to_half(-f32::NAN) & 0x8000, 0x8000);
+        // The smallest f32 NaN payload still makes a NaN, not infinity.
+        assert!(is_nan(f32_to_half(f32::from_bits(0x7f80_0001))));
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
+        // Halfway above 1.0 (an even mantissa) stays; above 1 + 2^-10 (odd)
+        // goes up to the even one.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
+        // Just past halfway still rounds up.
+        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
     }
 
     /// A rounding that carries out of the mantissa raises the exponent
