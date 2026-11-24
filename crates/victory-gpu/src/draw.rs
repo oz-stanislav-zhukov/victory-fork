@@ -2131,9 +2131,10 @@ impl State {
         let rects = self.topology == RECTANGLES && !self.completes_rects();
         let ran = ready && (!rects || self.rectangles(list, vertices, first));
         if ran {
-            // Rectangles were expanded into their own vertex buffers.
+            // Rectangles were expanded into their own vertex buffers (their
+            // count checked to fit by `rectangles`).
             let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
+                (expanded_vertices(vertices).unwrap_or(0), 0)
             } else {
                 (vertices, first)
             };
@@ -2165,6 +2166,12 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
+        // The draw runs `count / 3 * 6` vertices, a count the host takes in
+        // 32 bits.
+        if expanded_vertices(count).is_none() {
+            once!(count, "too many rectangle vertices");
+            return false;
+        }
         let rects = u64::from(count / 3);
         for slot in 0..32 {
             let elements: Vec<(u32, u32)> = p
@@ -2178,16 +2185,20 @@ impl State {
             }
             let v = self.vertex[slot as usize];
             let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let source = rect_source(first, count, v.stride, v.size)
+                .filter(|_| v.address != 0)
+                .map(|offset| v.address + offset)
+                .filter(|&from| crate::shadow::find(from, rects * 3 * stride).is_some());
+            let Some(from) = source else {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
-            }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            };
+            // The expanded vertices' view takes its size in 32 bits.
+            let Ok(span) = u32::try_from(rects * 6 * stride) else {
+                once!(slot, "rectangle vertices too many to expand");
+                return false;
+            };
+            let Some((gpu, to)) = list.scratch(u64::from(span)) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
@@ -2209,7 +2220,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: span,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -2669,6 +2680,52 @@ const RECTANGLES: u32 = 17;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
+
+/// The host vertices `vertices` rectangle-list vertices become (six per
+/// rectangle), if the count fits in 32 bits.
+fn expanded_vertices(vertices: u32) -> Option<u32> {
+    (vertices / 3).checked_mul(6)
+}
+
+/// The byte offset of vertex `first` in a buffer of `size` bytes holding
+/// `stride`-byte vertices, if vertices `first..first + count` all lie in
+/// it. Computed wide: `first + count` and the byte offsets overflow 32
+/// bits with the values a title may pass.
+fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
+    let stride = u64::from(stride);
+    let end = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
+    (stride != 0 && end <= u64::from(size)).then(|| u64::from(first) * stride)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expanded_vertices, rect_source};
+
+    #[test]
+    fn rectangle_vertices_inside_their_buffer() {
+        assert_eq!(rect_source(0, 3, 16, 48), Some(0));
+        assert_eq!(rect_source(3, 3, 16, 96), Some(48));
+        assert_eq!(rect_source(3, 3, 16, 95), None);
+        assert_eq!(rect_source(0, 3, 0, 48), None);
+    }
+
+    /// `first + count` past 32 bits wrapped to a small count before, which
+    /// passed the bounds check and read far outside the buffer.
+    #[test]
+    fn rectangle_bounds_do_not_wrap() {
+        assert_eq!(rect_source(u32::MAX, 3, 16, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX - 1, 3, 1, u32::MAX), None);
+        assert_eq!(rect_source(u32::MAX, u32::MAX, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn expanded_counts_fit_32_bits() {
+        assert_eq!(expanded_vertices(3), Some(6));
+        assert_eq!(expanded_vertices(7), Some(12));
+        assert_eq!(expanded_vertices(u32::MAX / 6 * 3), Some(u32::MAX / 6 * 6));
+        assert_eq!(expanded_vertices(u32::MAX), None);
+    }
+}
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
