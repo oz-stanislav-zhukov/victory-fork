@@ -5598,11 +5598,68 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// Luminance bounds of the host display when HDR (HDR10 / PQ) is active on
+/// Windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HdrDisplayInfo {
+    pub min_luminance: f32,
+    pub max_luminance: f32,
+    pub max_full_frame_luminance: f32,
+}
+
+/// Queries the host display outputs for an active HDR10 (`G2084_NONE_P2020`)
+/// desktop mode. Returns `None` when HDR is disabled or unsupported.
+pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
+    // SAFETY: plain DXGI factory, adapter and output enumeration.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let adapter: IDXGIAdapter1 = if let Some(host) = host() {
+            let luid = host.device.GetAdapterLuid();
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(luid)
+                .or_else(|_| factory.EnumAdapters1(0))
+                .ok()?
+        } else {
+            factory.EnumAdapters1(0).ok()?
+        };
+        let mut i = 0u32;
+        while let Ok(output) = adapter.EnumOutputs(i) {
+            i += 1;
+            let Ok(output6) = output.cast::<IDXGIOutput6>() else {
+                continue;
+            };
+            let Ok(desc) = output6.GetDesc1() else {
+                continue;
+            };
+            if desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+                return Some(HdrDisplayInfo {
+                    min_luminance: desc.MinLuminance,
+                    max_luminance: desc.MaxLuminance,
+                    max_full_frame_luminance: desc.MaxFullFrameLuminance,
+                });
+            }
+        }
+        None
+    }
+}
+
+fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
+    if !hdr_active {
+        return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+    match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    }
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    color_space: DXGI_COLOR_SPACE_TYPE,
     copy: HostList,
     /// With presents sent ahead ([`late_free_present`]): a list for each
     /// present in the air, and the submission it last flew as (it is used
@@ -5610,6 +5667,39 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+}
+
+impl Presenter {
+    fn sync_color_space(&mut self, hdr_active: bool) {
+        let wanted = desired_color_space(self.format, hdr_active);
+        if self.color_space == wanted {
+            return;
+        }
+        // SAFETY: `self.swap_chain` is a live `IDXGISwapChain3`.
+        let supported = unsafe { self.swap_chain.CheckColorSpaceSupport(wanted) }.unwrap_or(0);
+        if supported & (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) == 0 {
+            tracing::debug!(
+                color_space = wanted.0,
+                supported,
+                "swap chain color space unsupported on host output"
+            );
+            return;
+        }
+        // SAFETY: `wanted` is supported for presentation on `self.swap_chain`.
+        match unsafe { self.swap_chain.SetColorSpace1(wanted) } {
+            Ok(()) => {
+                self.color_space = wanted;
+                tracing::info!(
+                    format = self.format.0,
+                    color_space = wanted.0,
+                    "swap chain color space set"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, color_space = wanted.0, "SetColorSpace1 failed");
+            }
+        }
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -5904,6 +5994,14 @@ impl Host {
                 }
             }
         }
+        if matches!(
+            format,
+            DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT
+        ) {
+            p.sync_color_space(display_hdr_info().is_some());
+        } else {
+            p.sync_color_space(false);
+        }
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -6013,16 +6111,19 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
-            Ok(Presenter {
+            let mut p = Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
                 copy,
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-            })
+            };
+            p.sync_color_space(display_hdr_info().is_some());
+            Ok(p)
         }
     }
 }
