@@ -5733,7 +5733,19 @@ impl<'a> Lower<'a> {
                     6 => (one, field(self, 1)),
                     _ => (field(self, 1), field(self, 2)),
                 };
-                let levels = if uav { one } else { field(self, 3) };
+                // The level count only feeds word 3. A level query of a 3D
+                // image inside a loop crashes NVIDIA's Vulkan compiler (vkd3d-
+                // proton turns it into OpImageQueryLevels), so query it only
+                // when the program reads that word as data.
+                let reads_word3 = (0..count)
+                    .filter(|&k| k.wrapping_sub(u32::from(first)) == 3)
+                    .filter_map(|k| inst.write(Reg::S(code + k as u8)))
+                    .any(|v| self.read_as_data(v));
+                let levels = if uav || !reads_word3 {
+                    one
+                } else {
+                    field(self, 3)
+                };
                 let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
                 let (w, height, depth, levels) = (
                     less(self, w),
@@ -5799,6 +5811,20 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether an instruction or phi reads `v` other than as a resource
+    /// operand of a memory instruction (which takes the descriptor whole).
+    fn read_as_data(&self, v: Value) -> bool {
+        self.x.p.blocks.iter().any(|b| {
+            b.phis.iter().any(|p| p.args.contains(&v))
+                || b.insts.iter().any(|i| {
+                    !matches!(
+                        i.fields,
+                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+                    ) && i.reads.iter().any(|r| r.1 == v)
+                })
+        })
     }
 
     /// `s_load_dword*` from the program's constant table.
