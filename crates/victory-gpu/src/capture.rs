@@ -114,6 +114,174 @@ static RING: std::sync::Mutex<std::collections::VecDeque<String>> =
 #[cfg(feature = "diagnostics")]
 const RING_LINES: usize = 6000;
 
+/// The indirect argument records one [`listed`] frame's draws ran with,
+/// copied on the GPU right after each draw ([`copy_indirect`]) into one
+/// read-back buffer, read [`ARGS_LAG`] presents later ([`read_gpu_args`]).
+#[cfg(feature = "diagnostics")]
+struct ArgsReadback {
+    frame: u64,
+    buffer: ID3D12Resource,
+    used: u64,
+    /// Title argument address, kind, max, stride, offset in `buffer`, bytes.
+    entries: Vec<(u64, u32, u32, u32, u64, u64)>,
+}
+
+/// The frame being recorded, and frames waiting to be read.
+#[cfg(feature = "diagnostics")]
+static ARGS: std::sync::Mutex<(Option<ArgsReadback>, Vec<ArgsReadback>)> =
+    std::sync::Mutex::new((None, Vec::new()));
+
+/// Read-back bytes a frame holds at most (records past it are not copied).
+#[cfg(feature = "diagnostics")]
+const ARGS_BYTES: u64 = 8 << 20;
+
+/// Presents after a frame's own before its read-back is read: with the
+/// relay, submissions run ahead of the wait for the card.
+#[cfg(feature = "diagnostics")]
+const ARGS_LAG: u64 = 4;
+
+/// With a capture folder, for the frames [`listed`]: right after an
+/// indirect draw or dispatch, the clamped records it ran with (`bytes` at
+/// `at` in its scratch buffer, in `COMMON` after
+/// `crate::indirect::done`) are copied on the GPU into the frame's
+/// read-back buffer, to be written to `frame-<n>-gpuargs.txt`: what the
+/// card drew, where reading title memory afterwards shows what the title
+/// wrote there last (or nothing: the GPU's own copies are rewritten each
+/// frame).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_indirect(
+    list: &crate::host::HostList,
+    scratch: &ID3D12Resource,
+    at: u64,
+    (kind, stride, max): (u32, u32, u32),
+    arguments: u64,
+) {
+    let frame = crate::queue::presented() + 1;
+    if folder().is_none() || !listed(frame) {
+        return;
+    }
+    let bytes = u64::from(stride) * u64::from(max.max(1));
+    if bytes == 0 || bytes > 4096 {
+        return;
+    }
+    let mut guard = ARGS.lock().unwrap_or_else(|e| e.into_inner());
+    let (current, waiting) = &mut *guard;
+    if current.as_ref().is_some_and(|r| r.frame != frame)
+        && let Some(done) = current.take()
+    {
+        waiting.push(done);
+    }
+    if current.is_none() {
+        let Some(host) = crate::host::host() else { return };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: ARGS_BYTES,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        let (Ok(()), Some(buffer)) = (made, buffer) else {
+            tracing::warn!("indirect argument read-back: no buffer");
+            return;
+        };
+        *current = Some(ArgsReadback { frame, buffer, used: 0, entries: Vec::new() });
+    }
+    let Some(rb) = current.as_mut() else { return };
+    if rb.used + bytes > ARGS_BYTES {
+        return;
+    }
+    let off = rb.used;
+    rb.used += bytes.next_multiple_of(16);
+    use crate::host::transition;
+    // SAFETY: an open list; the scratch buffer is kept alive by the list
+    // and in COMMON; the read-back buffer lives until it is read.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            scratch,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        list.list.CopyBufferRegion(&rb.buffer, off, scratch, at, bytes);
+        list.list.ResourceBarrier(&[transition(
+            scratch,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
+    }
+    rb.entries.push((arguments, kind, max, stride, off, bytes));
+}
+
+/// At the present of `presented`: frames [`ARGS_LAG`] or more back whose
+/// records were copied ([`copy_indirect`]) are written to
+/// `frame-<n>-gpuargs.txt`, one line per op in recording order: argument
+/// address, kind, max, stride, and each record's words.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn read_gpu_args(presented: u64) {
+    use std::io::Write;
+    let Some(folder) = folder() else { return };
+    let due: Vec<ArgsReadback> = {
+        let mut guard = ARGS.lock().unwrap_or_else(|e| e.into_inner());
+        let (current, waiting) = &mut *guard;
+        if current.as_ref().is_some_and(|r| r.frame + ARGS_LAG <= presented)
+            && let Some(done) = current.take()
+        {
+            waiting.push(done);
+        }
+        let (due, keep): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|r| r.frame + ARGS_LAG <= presented);
+        *waiting = keep;
+        due
+    };
+    for rb in due {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copies ran (`ARGS_LAG` presents later); the mapping
+        // spans the buffer.
+        unsafe {
+            if rb.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+                continue;
+            }
+            let all = std::slice::from_raw_parts(data.cast::<u8>(), ARGS_BYTES as usize);
+            if let Ok(mut f) = std::fs::File::create(folder.join(format!("frame-{}-gpuargs.txt", rb.frame))) {
+                for &(arguments, kind, max, stride, off, bytes) in &rb.entries {
+                    let words: Vec<u32> = all[off as usize..(off + bytes) as usize]
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    let per = (stride / 4).max(1) as usize;
+                    let records: Vec<String> = words
+                        .chunks(per)
+                        .map(|r| format!("[{}]", r.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(" ")))
+                        .collect();
+                    let _ = writeln!(
+                        f,
+                        "at {arguments:#x} kind {kind} max {max} stride {stride} records {}",
+                        records.join(" ")
+                    );
+                }
+            }
+            rb.buffer.Unmap(0, None);
+        }
+    }
+}
+
 /// Whether `VICTORY_CAPTURE_WORLD` is set.
 fn world_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

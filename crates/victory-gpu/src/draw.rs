@@ -2462,6 +2462,8 @@ impl State {
             self.mesh_scissor(list, false);
         }
         crate::indirect::done(list, &bounded);
+        #[cfg(feature = "diagnostics")]
+        crate::capture::copy_indirect(list, &bounded, at, (kind, stride, max), arguments);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
