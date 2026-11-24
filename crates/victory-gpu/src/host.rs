@@ -6165,6 +6165,27 @@ pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
 }
 
+/// Whether the host may make render target views of `texture`. A texture
+/// the host refused as a render target is made without that use (see
+/// `resource::host_texture`; NVIDIA refuses B4G4R4A4), and a render target
+/// view of it is an invalid call that removes the device (0x887A0001).
+pub(crate) fn renders_to(texture: &ID3D12Resource) -> bool {
+    // SAFETY: a live resource.
+    let flags = unsafe { texture.GetDesc() }.Flags;
+    flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
+}
+
+/// A typed null render target view for a slot whose texture the host
+/// cannot render to: draws to it are discarded and the other slots keep
+/// their place.
+pub(crate) fn null_target() -> D3D12_RENDER_TARGET_VIEW_DESC {
+    D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    }
+}
+
 /// [`legal_state`] for a texture with resource flags `flags`.
 pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     // (flag, set or clear forbids, state bits): render target, unordered
@@ -6511,6 +6532,52 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    #[test]
+    fn only_textures_made_for_rendering_take_render_target_views() {
+        let Some(host) = host() else { return };
+        let make = |flags: D3D12_RESOURCE_FLAGS| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a full description and our out pointer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            texture.unwrap()
+        };
+        assert!(renders_to(&make(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)));
+        assert!(!renders_to(&make(D3D12_RESOURCE_FLAG_NONE)));
+        // The view bound in such a texture's place is a legal one.
+        host.rtv(None, Some(&null_target()));
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }
 

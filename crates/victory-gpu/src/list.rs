@@ -1212,6 +1212,11 @@ extern "system" fn clear_rtv(
         ) else {
             return;
         };
+        // A texture the host cannot render to has no view to clear, nor a
+        // render-target state to move to (see `host::renders_to`).
+        if !crate::host::renders_to(texture) {
+            return;
+        }
         // SAFETY: the title passes four floats (null is tolerated).
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
