@@ -2386,7 +2386,13 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+        // `VICTORY_FULL_REFRESH=1` (experiment, off by default): every
+        // refresh copies the whole range, as for memory nothing watches,
+        // whatever the journal, guards or kernel say was written. If a
+        // write the tracking misses left a copy stale, this shows it.
+        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let full = *FULL.get_or_init(|| std::env::var("VICTORY_FULL_REFRESH").as_deref() == Ok("1"));
+        if !full && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
