@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use victory_game::sgd5;
@@ -11,6 +11,22 @@ use victory_shader::{Container, DxilProgram, FourCC, HwStage, ShaderError, nativ
 
 /// Files above this size are skipped (read whole into memory for now).
 pub(crate) const MAX_FILE: u64 = 2 << 30;
+
+pub(crate) fn scan_entries<'a>(
+    root: &'a Path,
+    walk_errors: &'a mut usize,
+) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                eprintln!("{error}");
+                *walk_errors += 1;
+                None
+            }
+        })
+}
 
 /// A shader container in a file: as is, or packed in an SGD5 record.
 pub(crate) enum Source<'a> {
@@ -77,11 +93,9 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
+    let mut walk_errors = 0;
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in scan_entries(root, &mut walk_errors) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -216,9 +230,13 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
             println!("  opcode not in table  {op} x{n}");
         }
     }
-    if t.containers == 0 {
+    if t.containers == 0 && walk_errors == 0 {
         println!("(none found: shaders may sit in compressed or encrypted archives)");
     }
+    anyhow::ensure!(
+        walk_errors == 0,
+        "scan incomplete (traversal errors: {walk_errors})"
+    );
     Ok(())
 }
 
