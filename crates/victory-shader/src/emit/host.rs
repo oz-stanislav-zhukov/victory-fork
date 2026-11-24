@@ -115,7 +115,8 @@ impl Host {
                 .map_err(err)?;
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
-                    "the device supports SM {:#x} only",
+                    "the device supports SM {:#x} only (on Windows 10, \
+                     `cargo xtask agility` puts a newer D3D12 runtime beside victory.exe)",
                     sm.HighestShaderModel.0
                 ));
             }
