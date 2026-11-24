@@ -186,9 +186,15 @@ impl Bits<'_> {
         (v << (24 + self.pos % 8) >> 32) as u32
     }
 
+    /// The next `n` bits as an unsigned number. Past 32 bits only the low 32
+    /// are kept, and all `n` are consumed.
     fn read(&mut self, n: u32) -> u32 {
         if n == 0 {
             return 0;
+        }
+        if n > 32 {
+            self.pos += (n - 32) as usize;
+            return self.read(32);
         }
         let v = self.peek32() >> (32 - n);
         self.pos += n as usize;
@@ -199,8 +205,17 @@ impl Bits<'_> {
         self.read(1) != 0
     }
 
+    /// The next `n` bits as a two's complement number. Zero bits read as 0;
+    /// from 32 bits on, the low 32 are the value, as with `read`.
     fn signed(&mut self, n: u32) -> i32 {
-        ((self.read(n) << (32 - n)) as i32) >> (32 - n)
+        match n {
+            0 => 0,
+            1..32 => {
+                let shift = 32 - n;
+                ((self.read(n) << shift) as i32) >> shift
+            }
+            _ => self.read(n) as i32,
+        }
     }
 
     fn consumed(&self) -> usize {
@@ -1369,6 +1384,36 @@ mod tests {
                 data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
             }
         }
+    }
+
+    /// Bit widths at the edges of what `Bits` can return: none, a full
+    /// 32-bit word, and more than one word. None of them may overflow a shift.
+    #[test]
+    fn bits_read_zero_full_and_oversized_widths() {
+        let mut data = [0u8; 16];
+        put_bits(&mut data, 0, 6, 0b11_1110); // -2 in 6 bits
+        put_bits(&mut data, 6, 32, 0x1234_5678);
+        put_bits(&mut data, 38, 32, 0xffff_fffe); // -2 in 32 bits
+        put_bits(&mut data, 70, 8, 0xab); // dropped high bits of a 40-bit read
+        put_bits(&mut data, 78, 32, 0x8000_0001);
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+
+        assert_eq!(b.signed(0), 0);
+        assert_eq!(b.read(0), 0);
+        assert_eq!(b.consumed(), 0, "zero-width reads consume nothing");
+        assert_eq!(b.signed(6), -2);
+        assert_eq!(b.read(32), 0x1234_5678);
+        assert_eq!(b.signed(32), -2);
+        assert_eq!(b.read(40), 0x8000_0001, "the low 32 bits of a 40-bit field");
+        assert_eq!(b.consumed(), 110);
+
+        b.pos = 70;
+        assert_eq!(b.signed(40), 0x8000_0001_u32 as i32);
+        assert_eq!(b.consumed(), 110);
     }
 
     /// A damaged packet whose first frame says it is 0 bits long: finding
