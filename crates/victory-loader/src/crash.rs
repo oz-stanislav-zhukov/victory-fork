@@ -722,9 +722,9 @@ fn module_of(address: usize) -> Option<String> {
 /// overrun, a write to code or constants.
 fn memory_at(address: usize) -> String {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
-        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
-        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+        MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
     };
     // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -751,10 +751,25 @@ fn memory_at(address: usize) -> String {
             _ => format!("protection {:#x}", info.Protect),
         },
     };
-    match module_of(address) {
-        Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
-        _ => protect,
+    // VirtualQuery reports the current mapping. A read fault can still
+    // describe a read-write page, so keep its backing and extent as well.
+    let kind = match info.Type {
+        MEM_PRIVATE => "private",
+        MEM_MAPPED => "mapped",
+        MEM_IMAGE => "image",
+        _ => "unknown",
+    };
+    let mut detail = protect;
+    if info.Type == MEM_IMAGE
+        && let Some(module) = module_of(address)
+    {
+        detail.push_str(&format!(", in {module}"));
     }
+    let offset = address - info.AllocationBase as usize;
+    format!(
+        "{detail}, {kind} allocation +{offset:#x}, region size {:#x}",
+        info.RegionSize
+    )
 }
 
 #[cfg(test)]
@@ -881,10 +896,10 @@ mod tests {
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
             PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
-        // SAFETY: reserves four pages of ours and commits three of them;
+        // SAFETY: reserves five pages of ours and commits four of them;
         // nothing reads or writes them.
         let base = unsafe {
-            let base = VirtualAlloc(std::ptr::null(), 0x4000, MEM_RESERVE, PAGE_NOACCESS);
+            let base = VirtualAlloc(std::ptr::null(), 0x5000, MEM_RESERVE, PAGE_NOACCESS);
             assert!(!base.is_null());
             let page = |i: usize, protect| {
                 let at = base.cast::<u8>().add(i * 0x1000).cast();
@@ -893,12 +908,23 @@ mod tests {
             page(1, PAGE_READONLY);
             page(2, PAGE_READWRITE | PAGE_GUARD);
             page(3, PAGE_NOACCESS);
+            page(4, PAGE_READWRITE);
             base as usize
         };
         assert_eq!(memory_at(base + 8), "reserved, never committed");
-        assert_eq!(memory_at(base + 0x1008), "read-only");
+        assert_eq!(
+            memory_at(base + 0x1008),
+            "read-only, private allocation +0x1008, region size 0x1000"
+        );
         assert_eq!(memory_at(base + 0x2008), "a guard page");
-        assert_eq!(memory_at(base + 0x3008), "no access");
+        assert_eq!(
+            memory_at(base + 0x3008),
+            "no access, private allocation +0x3008, region size 0x1000"
+        );
+        assert_eq!(
+            memory_at(base + 0x4008),
+            "read-write, private allocation +0x4008, region size 0x1000"
+        );
         // SAFETY: releases the reservation made above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
         assert_eq!(memory_at(base + 8), "nothing mapped there");
@@ -906,7 +932,8 @@ mod tests {
         assert_eq!(memory_at(usize::MAX), "outside the address space");
         // This test's own code: an image page, named by its module.
         let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
-        let named = code.starts_with("read-execute, in victory_loader-");
+        let named = code.starts_with("read-execute, in victory_loader-")
+            && code.contains(", image allocation +");
         assert!(named, "{code}");
     }
 
