@@ -666,11 +666,15 @@ impl Staging {
         // where two textures change (run 58). It is guarded now, as buffers
         // in view memory are: a write of the title's to it faults once and
         // is noted, a mapping is announced by the runtime. While neither
-        // happened the texture is as it was. What the guard cannot see (a
-        // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // happened the texture is as it was. A write through another view
+        // of the same pages is a fault of that view too (the guard makes
+        // every view of them read-only, `crate::watch`), and a write the
+        // runtime makes itself into physical pages is told to the guard
+        // there; the hash is the net under both, taken every eighth frame
+        // by the texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        #[cfg(feature = "diagnostics")]
+        let mut unreported = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
@@ -694,6 +698,10 @@ impl Staging {
                 return 0;
             }
             blind = unwritten;
+            #[cfg(feature = "diagnostics")]
+            {
+                unreported = unwritten;
+            }
         }
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
@@ -746,6 +754,10 @@ impl Staging {
                     return false;
                 }
                 self.detile(read);
+                #[cfg(feature = "diagnostics")]
+                if unreported {
+                    self.unreported_change();
+                }
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -769,6 +781,10 @@ impl Staging {
                 found_blind(last);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
+                if unreported {
+                    self.unreported_change();
+                }
+                #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             });
@@ -786,8 +802,28 @@ impl Staging {
         found_blind(last);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
+        if unreported {
+            self.unreported_change();
+        }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Diagnostics: the first time a texture's hash found a change that the
+    /// guard over its memory did not report (a write through another view
+    /// of its pages, which the guard now watches too).
+    #[cfg(feature = "diagnostics")]
+    fn unreported_change(&self) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                address = format_args!("{:#x}", self.memory as usize),
+                size = self.layout.size,
+                desc = ?self.layout.desc,
+                "a texture's hash found a change its guard did not report: a write through another view of its memory"
+            );
+        });
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
