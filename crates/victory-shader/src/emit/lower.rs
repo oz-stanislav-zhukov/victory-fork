@@ -8666,6 +8666,18 @@ impl<'a> Lower<'a> {
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
+            if inst.name().starts_with("v_interp_p1") {
+                let dst = match &inst.fields {
+                    Fields::Vintrp { dst, .. } => *dst,
+                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+                    _ => unreachable!(),
+                };
+                if let Operand::Vector { reg, .. } = dst {
+                    let z = self.s.m.i32(0);
+                    self.write(inst, Reg::V(reg), z, None);
+                }
+                return Ok(());
+            }
             return Err("the first half of an interpolation");
         };
         let name = inst.name();
