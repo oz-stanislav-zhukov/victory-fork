@@ -11,5 +11,9 @@ publish.workspace = true
 memchr.workspace = true
 miniz_oxide.workspace = true
 
+[dev-dependencies]
+# The shader survey's raw container scan, checked together with records.
+victory-shader.workspace = true
+
 [lints]
 workspace = true
