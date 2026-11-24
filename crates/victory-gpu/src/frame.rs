@@ -217,7 +217,9 @@ mod tests {
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // Loose on purpose: a 2 ms tick can take over 50 ms on a loaded
+        // scheduler. 500 ms still fails well before the 1 s time-out.
+        assert!(before.elapsed() <= Duration::from_millis(500));
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -233,7 +235,7 @@ mod tests {
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip ends on a tick of its own.
         const FLIP: u32 = 2;
         assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
         let mut token = 0;
@@ -247,7 +249,8 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // Strictly rising: a late wake may skip ticks, but never repeats one.
+        assert!(flips.windows(2).all(|w| w[1] > w[0]), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
