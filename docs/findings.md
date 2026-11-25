@@ -56,7 +56,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Open problems
 1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard. Suspect skin/SSS shader.
 2. Lucia's eyes glow white/blue in close-ups.
-3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split.
+3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
 4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
 5. Rays: builder runs but darkens the image and doubles GPU time.
 6. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
