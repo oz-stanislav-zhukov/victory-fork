@@ -2120,10 +2120,18 @@ impl State {
             once!("no ambient light: other tables");
             return false;
         };
-        let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
-            return false;
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
-        let light = match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+        let light = match view(ResourceType::Uav, (u.slot, u.table_offset_dwords)) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
         };
@@ -2131,7 +2139,12 @@ impl State {
             once!("no ambient light: no image");
             return false;
         }
-        crate::ambient::raise(list, light as This)
+        // The depth the resolve reads: the light is shaded in creases.
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
