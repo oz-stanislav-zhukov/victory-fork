@@ -65,3 +65,7 @@ SHADER_OPT=0 BVH_BUILDER=1 BVH_QUARANTINE=1 RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD
 - Waitress face rainbow speckle STILL there (bar) -> Belobug helper-lane quad fix does not cure it. Lucia close-up: eyes glow white/purple (new or old? earlier "black eyes"). Bottom blocky band still.
 - Posted update to fxceless#148 (comment 7162173259): ceiling on a26859f, #854 (0 untranslated/refused, builder crash -> #16), #857/#853 ~no gain on Windows, da125a4 warning.
 - #148 title updated (ceiling on a26859f, 2.9-3.5 fps, stable w/o builder).
+- Copy-back analysis (runW): the copy-back thread spends ~160 of ~190 ms waiting for the card to fetch card-copy pieces (7 waits/frame); card ~73% busy, GPU ~185 ms. => frame is GPU-bound; copy-back is not the lever, GPU work is.
+- #310 (our issue): bottom blocky band = cut indirect dispatch >65,535 groups in x (lighting over classified tiles 2dc364df5d3278b8, 85-115k groups) per SantannaCarlos; PR #834 runs the rest. Blocks seen with SHADER_OPT=0 too -> opt passes were not the mosaic cause.
+- runX (fork-speed + #834, SHADER_OPT default/on): warm-up ~2400 pipelines; then 3.6-3.8 fps, 265-280 ms/frame (~4.8k draws), copy-back ~170. ❌ cell much darker: ceiling lamps/light gone. 0 untranslated/refused. Suspect opt passes miscompile a lighting shader.
+- runY (same, SHADER_OPT=0) for A/B: library had been filled by runX variants -> 1,500-2,300 re-made; user closed window mid warm-up (lib saved: 644 made). Pending A/B.
