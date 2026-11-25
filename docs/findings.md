@@ -57,7 +57,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Open problems
 1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard, intermittent (Z3 clean, Z6 speckled, Z7 clean). Qwen report 01: v_interp_p2_f16 always writes the low half (lower.rs low_half), fixed by fxceless #934; #927 notes an intermediate form gave 'rainbow squares on the waitress' skin'. Both merged on branch fork-skin, to run next.
 1b. Faces and some objects flicker black for a frame (Z7). Ambient counters (seen / replaced / indirect) in the log will tell if the resolve sometimes runs unreplaced.
-2. Lucia's eyes glow white/blue in close-ups.
+2. Lucia's eyes glow white/blue in close-ups. Qwen report 02: same #934 (v_interp_p2_f16 drops clamp/omod: values >1 blow out white); #948/#1019/#927 unlikely. Test on fork-skin.
+2b. Z7: guard's forearms fully rainbow at door B35 (face clean): skin noise is per shader variant, not per run.
 3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
 4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
 5. Rays: builder runs but darkens the image and doubles GPU time.
