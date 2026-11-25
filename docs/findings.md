@@ -14,6 +14,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
+| Z7 | fork-rays (+ambient counters) | builder OFF, guard ON | 3.3-3.7 cell | 267-306 | user: best so far. Waitress face CLEAN (speckled in Z6, clean in Z3: intermittent). Lucia's/waitress eyes still glow. Faces and some objects flicker black now and then. Corners lack occlusion -> live AO raised (ambient.txt 0.5 1 0.98 0.94 2.2 1.2 0.1 0.45, default kept in ambient-default.txt) | guard back on = textures 4-32 ms again |
 | Z6 | fork-rays (+#148) | builder OFF, `TEXTURE_GUARD=0` | 3-4 (median 3.4); hall 2 | 243-385; hall 443 (9.6k draws) | bright again; corridor walls normal (were black in Z4); waitress face STILL rainbow; Lucia eyes glow; orange 8x8 blocks on Lucia's hair in common room | fork-rays = new base. Guard is not the skin noise |
 | Z5 | fork-rays | #993+#994, builder ON | 2.4-3.0 | 335-460 | much darker, GPU ~270 ms, copy-back ~280 ms | builder runs without crash, but rays not worth it yet |
 | Z4 | fork-pool | +#959 | 3.7-4.1 | 244-273 | corridor walls black + white patches; skin speckle | no crash in 10+ min |
@@ -54,7 +55,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | Candidates: fxceless #995 #1014 #1013 #1006 #934 #927, Zettrox #99, Belobug 72e748ea | pending | see Qwen research reports |
 
 ## Open problems
-1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard. Suspect skin/SSS shader.
+1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard, intermittent (Z3 clean, Z6 speckled, Z7 clean). Qwen report 01: v_interp_p2_f16 always writes the low half (lower.rs low_half), fixed by fxceless #934; #927 notes an intermediate form gave 'rainbow squares on the waitress' skin'. Both merged on branch fork-skin, to run next.
+1b. Faces and some objects flicker black for a frame (Z7). Ambient counters (seen / replaced / indirect) in the log will tell if the resolve sometimes runs unreplaced.
 2. Lucia's eyes glow white/blue in close-ups.
 3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
 4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
