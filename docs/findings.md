@@ -91,6 +91,11 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 - Split #927 vs #934 for the grey wall blotches (fork-934 has #934 + #1002 without #927).
 - Ambient counters threshold 2000 too high (never printed in 13 min): lower to ~200.
 
+## Other forks checked
+| Fork | Base | Verdict for us (NVIDIA 32-lane, Win10) |
+|---|---|---|
+| DexNom/VIctory (PortWatch #1, 78%, 2026-11-25) | Marvisak/VIctory + ZSlayerHQ victory-world-runtime, Radeon-focused; issues disabled | Not ahead on NVIDIA: their own NVIDIA reports (PR #14 RTX 3060 Ti: ~2 fps, 517 ms; PR #15 RTX 4070: 1-1.4 fps, 700-1000 ms), RT cannot start on 32-lane (8 pipelines refused, builder missing=5 of 53). We: 4.7-5.1 fps (Z9) and the builder runs (#854 + #994). Different tree (Marvisak), so ports are big. Idea worth knowing: cd94d353 view marks (shaders set a bit per 64 KiB page they write; copy-back compares only marked pages: was 2.8-4.5 GB/frame). Their PR #12 (Agility SDK at runtime for Win10) we already have via #22. |
+
 ## Where we stand (2026-11-25, end of session)
 - Best picture: fork-skin / fork-934 line (Z7-Z8): bright cell, walls fine, skin noise gone on the guard's arms (#934/#927). Best speed: fork-fast + speed switches (Z9): 4.7-5.1 fps, but the cell is dark again and cutscenes blow out white.
 - NEXT 1: bisect Z9's switches for the darkness, one per run, same fork-fast build: drop BACK_OWN_VIEW first, then JOIN_PARTS, then ASYNC_SUBMIT+QUEUE2, then INDIRECT_GATHER. If none: fork-fast without switches (the code itself: fxceless main or #1002).
