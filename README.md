@@ -267,6 +267,34 @@ Speed and memory:
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
+Stability and low-memory PCs (pull request from Sashwiin/victory-fork `share`,
+tested on an RTX 5070 Ti laptop with 16 GB of RAM):
+- The crash 7 to 11 minutes into the world (the title's instance pool full,
+  the intro stream never leaving its prestream state) is gone with upstream
+  VIctory's eight XMA/audio fixes (ba42db6, d4d1822, 1054fe8, 4eb0898,
+  985d8d4, 7a5d85e, 643fc6d, 03a6f22): the intro moves on, and one run went
+  36 minutes in the world without a crash.
+- `VICTORY_NO_WATCHDOG=1` skips the title's own watchdog (upstream #454).
+- `VICTORY_ADAPTER=<part of a name>` picks the host GPU by name; the pipeline
+  library is kept per adapter.
+- A pipeline library file that is there but unreadable or refused is never
+  saved over.
+- A wait for a submission ends when the device is lost or the GPU stalls,
+  instead of waiting forever (the relay's and send-ahead's waits still wait).
+- Lists' upload buffers are reused by size class (`VICTORY_UPLOAD_POOL=0`:
+  one per copy, as before).
+- `VICTORY_INPLACE_POOL=1` (with `VICTORY_INPLACE=1`) puts the title's page
+  pool in place too, in 32 MiB sections, at most `VICTORY_INPLACE_POOL_MB`
+  (1024) open. Off by default: stable, but it saved no memory here, since
+  the title remaps its streaming pool constantly. The host opens no section
+  of 4 GiB or more, and each opened section counts whole against the card's
+  share of the PC's memory. `VICTORY_INPLACE=2` hung the device with the
+  relay on (the relay turns late wait on); use 2 only with `VICTORY_RELAY=0`.
+- On 16 GB the frame is bound by paging (about 1-2.5 fps): copies of title
+  memory fault their pages back in. Windows outside buffers grow over a long
+  run (2.9 to 5.6 GB in ten minutes) because descriptor slots keep them
+  alive; that is the next thing to fix.
+
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
 `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).

@@ -59,6 +59,20 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Keeps the pipeline library and the early list in `dir` from now on.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    // A library belongs to one adapter and driver, and one of another is
+    // started empty and saved over the old: with `VICTORY_ADAPTER` (another
+    // GPU than the default) it is kept in a folder of that name, so a run on
+    // one GPU never replaces the library made on the other.
+    let dir = match std::env::var("VICTORY_ADAPTER") {
+        Ok(name) if !name.is_empty() => {
+            let name: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                .collect();
+            dir.join(format!("adapter-{name}"))
+        }
+        _ => dir,
+    };
     let _ = DIR.set(dir);
 }
 
@@ -442,8 +456,42 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let dir = DIR.get();
+            let blob = dir.map_or(Blob::None, |d| Blob::of(d));
+            // A library file that is there but could not be read or mapped
+            // (held by a scanner after a restart, say) is not one to start
+            // over: the empty library would be saved over it (a 1.8 GB
+            // pre-build was lost so, 2026-11-25). This run keeps no
+            // pipelines instead.
+            let path = dir.map(|d| d.join(LIBRARY_FILE));
+            let there = path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .is_some_and(|m| m.len() > 0);
+            if there && blob.bytes().is_empty() {
+                tracing::warn!(
+                    path = %path.as_ref().map_or_else(String::new, |p| p.display().to_string()),
+                    "host pipeline library there but unreadable: left alone, pipelines not kept this run"
+                );
+                return None;
+            }
             let library = open(&device, blob);
+            // One the host rejected (another adapter or driver, damage) is
+            // kept beside the new one, once, rather than saved over.
+            if there
+                && library.as_ref().is_some_and(|l| matches!(l._blob, Blob::None))
+                && let Some(d) = dir
+            {
+                let kept = d.join("host-pipelines.rejected.bin");
+                if let Err(e) = std::fs::rename(d.join(LIBRARY_FILE), &kept) {
+                    tracing::warn!(
+                        error = %e,
+                        "rejected host pipeline library could not be moved aside: pipelines not kept this run"
+                    );
+                    return None;
+                }
+                tracing::warn!(kept = %kept.display(), "rejected host pipeline library moved aside");
+            }
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }

@@ -543,11 +543,15 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let notifying = NOTIFYING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let physical = PHYSICAL.swap(0, Ordering::Relaxed) as f64 / 1e9;
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
+                notifying_workers = format_args!("{:.2}", notifying / elapsed.as_secs_f64()),
+                physical_workers = format_args!("{:.2}", physical / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 destination_waits = DESTINATION_WAITS.swap(0, Ordering::Relaxed),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
@@ -1030,6 +1034,19 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds workers spent, for the debug summary: telling the GPU side
+/// of a write before and after it (guards opened, copies and textures
+/// marked), and writing physical pages through a buffer (with retries).
+static NOTIFYING: AtomicU64 = AtomicU64::new(0);
+static PHYSICAL: AtomicU64 = AtomicU64::new(0);
+
+/// Runs `f`, adding its time to `counter`.
+fn timed<T>(counter: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
@@ -1073,7 +1090,7 @@ fn into_destination(
         // there changes. `fill` writes from user mode (a file read is read
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        timed(&NOTIFYING, || victory_gpu::kernel_will_write(request.destination as usize, len));
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1083,7 +1100,7 @@ fn into_destination(
         // end): a copy or a texture pass that took the memory while the
         // read was under way took what was there before. Counted; acted on
         // only with `VICTORY_PAGE_WRITES=all`.
-        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        timed(&NOTIFYING, || victory_gpu::title_memory_written(request.destination as usize, len, false));
         return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
@@ -1108,7 +1125,7 @@ fn into_destination(
         // learn of the bytes only from this (upstream c75fdba, fork PR
         // #571). After a decode that failed part way too: what it wrote
         // is there.
-        super::xmem::pages_written(&pages, offset, len);
+        timed(&NOTIFYING, || super::xmem::pages_written(&pages, offset, len));
         return filled;
     }
     let mut data = vec![0; len];
@@ -1157,6 +1174,7 @@ fn into_destination(
     // Since the start: writes that succeeded on a later try, and writes
     // given up.
     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let physical = std::time::Instant::now();
     let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
     let mut tries = 0u32;
     while !written && tries < retries {
@@ -1165,6 +1183,7 @@ fn into_destination(
         pages = read_pages();
         written = super::xmem::write_physical(&pages, offset, &data[..n]);
     }
+    PHYSICAL.fetch_add(physical.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if written {
         if tries > 0 {
             let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
@@ -1178,7 +1197,7 @@ fn into_destination(
             );
         }
         // As above, after the write that succeeded.
-        super::xmem::pages_written(&pages, offset, n);
+        timed(&NOTIFYING, || super::xmem::pages_written(&pages, offset, n));
         Ok(())
     } else {
         let known = super::xmem::pages_known(&pages, offset, n);

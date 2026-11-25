@@ -408,50 +408,78 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).is_none_or(|s| s == 0) {
         return 0;
-    };
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    // Under Wine a committed section is a sparse file, free until touched,
+    // and committing a reserved one page by page costs a wineserver
+    // request each that scans every range committed so far: commit it
+    // whole there. With the card reading the page pool in place
+    // (`VICTORY_INPLACE_POOL=1`) it is committed too, since only a
+    // committed section can be opened as a host heap, and cut into
+    // sections of `POOL_PIECE` pages: the host opens no section of 4 GiB or
+    // more (E_INVALIDARG, run-auto-12), and an opened section is resident
+    // with the card whole, however little of it the card reads. If the
+    // host cannot commit them, one reserved section as before (and not in
+    // place).
+    let create = |pages: usize, protect| {
+        let bytes = (pages * PAGE) as u64;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | protect,
+                (bytes >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        (!handle.is_null()).then(|| Arc::new(Section(handle)))
     };
-    if handle.is_null() {
+    let pieces: Option<Vec<Arc<Section>>> = if on_wine() {
+        create(n, SEC_COMMIT).map(|s| vec![s])
+    } else if victory_gpu::views_wanted() {
+        let made: Option<Vec<_>> = (0..n).step_by(POOL_PIECE).map(|at| create(POOL_PIECE.min(n - at), SEC_COMMIT)).collect();
+        if made.is_none() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "physical pages not committed whole (not in place): reserved instead");
+        }
+        made
+    } else {
+        None
+    };
+    let committed = pieces.is_some();
+    let Some(pieces) = pieces.or_else(|| create(n, SEC_RESERVE).map(|s| vec![s])) else {
         let error = std::io::Error::last_os_error();
         tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
         // SAFETY: checked non-null.
         unsafe { count.write(0) };
         return 0;
-    }
+    };
+    let per = if pieces.len() > 1 { POOL_PIECE } else { n };
     tracing::debug!(
         n,
+        sections = pieces.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    for (k, section) in pieces.iter().enumerate() {
+        let pages = per.min(n - k * per);
+        victory_gpu::title_memory_section(section.0 as usize, (pages * PAGE) as u64, committed);
+    }
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: pieces[index / per].clone(),
+            index: index % per,
         };
         let number = first + index * FRAMES;
         physical.pages.insert(number, slice);
@@ -460,6 +488,13 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     1
 }
+
+/// Pages per section when the page pool is made for the card to read in
+/// place: 32 MiB. The host opens sections below 4 GiB only, and each one
+/// opened counts whole against the card's share of the PC's memory: four
+/// of 1 GiB for 63 MB of windows ran it out (run-auto-13, E_OUTOFMEMORY
+/// closing command lists). Ranges across a seam are copied as before.
+const POOL_PIECE: usize = (32 << 20) / PAGE;
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds

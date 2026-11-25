@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -574,6 +574,71 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// How a wait for a submission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The host signalled the submission's fence.
+    Done,
+    /// The device was removed while the submission ran.
+    Removed,
+    /// Neither after [`STALL_SECS`]: the GPU has faulted or hung and the
+    /// host has not said so.
+    Stalled,
+}
+
+/// How long one wait for a submission lasts before the device is asked
+/// whether it is still there.
+const WAIT_SLICE_MS: u32 = 250;
+
+/// A submission still running after this many seconds is said so, and again
+/// each time that time has doubled.
+const LONG_WAIT_SECS: u64 = 10;
+
+/// A submission still running after this many seconds is given up. A host
+/// whose GPU faults may neither finish the work nor report the device
+/// removed: vkd3d-proton waits on the driver without an end unless
+/// `VKD3D_CONFIG=fault` or `breadcrumbs` is set, and says itself that such
+/// a wait of over 5 s is a lost device. Windows resets a device whose
+/// submission runs for about 2 s. The title ends its own run when its main
+/// thread has waited 30 s for the render thread, which a submission that
+/// never finishes brings about; this is below that, so the run ends with
+/// our report of the cause and not with the title's.
+const STALL_SECS: u64 = 25;
+
+/// Waits for a submission: `signalled` waits one slice ([`WAIT_SLICE_MS`])
+/// for its fence and says whether it came. Between slices `removed` asks
+/// the device whether it was removed, because a host that loses its device
+/// need not signal the fences of the work it dropped (vkd3d-proton after a
+/// GPU fault does not), and a wait without an end then holds the title's
+/// submit thread until the title ends the run, with no report of ours.
+/// `long` is told the seconds waited so far, at [`LONG_WAIT_SECS`] and each
+/// doubling of it; at [`STALL_SECS`] the wait is given up.
+fn wait_for_submission(
+    mut signalled: impl FnMut() -> bool,
+    mut removed: impl FnMut() -> bool,
+    mut long: impl FnMut(u64),
+) -> Waited {
+    let mut slices = 0u64;
+    let mut report_at = LONG_WAIT_SECS;
+    loop {
+        if signalled() {
+            return Waited::Done;
+        }
+        if removed() {
+            return Waited::Removed;
+        }
+        slices += 1;
+        let secs = slices * u64::from(WAIT_SLICE_MS) / 1000;
+        if secs >= STALL_SECS {
+            return Waited::Stalled;
+        }
+        if secs >= report_at {
+            long(secs);
+            report_at *= 2;
+        }
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -638,6 +703,8 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = named_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -717,6 +784,46 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// `VICTORY_ADAPTER=<part of a name>`: the hardware adapter whose name
+/// holds it (case ignored), else Windows' default. On a laptop with two
+/// GPUs this picks, say, an RDNA 2 integrated GPU (the console's GPU
+/// family, with 64-lane waves) over a 32-lane NVIDIA one, to compare what
+/// the title draws on each. Every adapter's name is logged when it is set.
+fn named_adapter() -> Option<IDXGIAdapter> {
+    let wanted = std::env::var("VICTORY_ADAPTER").ok()?.to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut found = None;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            let name = String::from_utf16_lossy(&desc.Description)
+                .trim_end_matches('\0')
+                .to_string();
+            let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+            tracing::info!(adapter = %name, software, "host adapter");
+            if found.is_none() && !software && name.to_lowercase().contains(&wanted) {
+                found = adapter.cast::<IDXGIAdapter>().ok().map(|a| (a, name));
+            }
+        }
+        match found {
+            Some((adapter, name)) => {
+                tracing::info!(adapter = %name, "VICTORY_ADAPTER: host device on this adapter");
+                Some(adapter)
+            }
+            None => {
+                tracing::warn!(wanted = %wanted, "VICTORY_ADAPTER names no hardware adapter; the default is used");
+                None
+            }
+        }
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -774,6 +881,67 @@ mod tests {
             }
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+
+    /// A submission's wait ends when its fence comes, or when the device is
+    /// gone and the fence never will.
+    #[test]
+    fn a_wait_for_a_submission_ends_when_the_device_is_removed() {
+        use super::{LONG_WAIT_SECS, STALL_SECS, WAIT_SLICE_MS, Waited, wait_for_submission};
+        let slices_per_sec = 1000 / u64::from(WAIT_SLICE_MS);
+        // The fence comes in the third slice: the device is asked twice.
+        let (mut waits, mut asked) = (0, 0);
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits == 3
+            },
+            || {
+                asked += 1;
+                false
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((done, waits, asked), (Waited::Done, 3, 2));
+        // The fence never comes and the device is removed in the fifth slice.
+        let mut asked = 0;
+        let lost = wait_for_submission(
+            || false,
+            || {
+                asked += 1;
+                asked == 5
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((lost, asked), (Waited::Removed, 5));
+        // A fence signalled together with the removal is a finished wait:
+        // the caller's check after the submission reports the removal.
+        assert_eq!(wait_for_submission(|| true, || true, |_| ()), Waited::Done);
+        // A long submission on a live device is waited for, and said so at
+        // 10 s and 20 s.
+        let (mut waits, mut said) = (0, Vec::new());
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits > 22 * slices_per_sec
+            },
+            || false,
+            |secs| said.push(secs),
+        );
+        assert_eq!(done, Waited::Done);
+        assert_eq!(said, [LONG_WAIT_SECS, 2 * LONG_WAIT_SECS]);
+        // One that neither finishes nor loses its device is given up, after
+        // every slice of the time allowed and no sooner.
+        let mut waits = 0;
+        let stalled = wait_for_submission(
+            || {
+                waits += 1;
+                false
+            },
+            || false,
+            |_| (),
+        );
+        assert_eq!((stalled, waits), (Waited::Stalled, STALL_SECS * slices_per_sec));
     }
 
     use super::*;
@@ -1489,6 +1657,55 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+/// Whether lists' upload buffers ([`HostList::upload`]) are kept for the
+/// next list when a list is done with them, by size class, instead of
+/// freed. One buffer was made and freed per copy: 155,286 upload buffers
+/// (61.7 GB) in run-auto-20, and the driver kept 242 blocks of 32 MB
+/// (5.4 GB) of write-combined memory for them. `VICTORY_UPLOAD_POOL=0`:
+/// one buffer per copy, as before.
+fn upload_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Upload buffers no list holds, by size class.
+static UPLOAD_SPARE: Mutex<Spare<Pooled>> = Mutex::new(Spare::new());
+/// The most bytes of upload buffers kept while no list holds them.
+const UPLOAD_SPARE_MOST: u64 = 256 << 20;
+/// Bigger asks get a buffer of their own, freed with the list.
+const UPLOAD_POOLED_MOST: u64 = 32 << 20;
+
+/// A mapped upload buffer that goes back to [`UPLOAD_SPARE`].
+struct Pooled {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+/// The size class an upload of `size` bytes takes from the pool, if any:
+/// the next power of two, at least 64 KiB.
+fn upload_class(size: u64) -> Option<u64> {
+    (upload_pool() && size <= UPLOAD_POOLED_MOST).then(|| size.max(64 << 10).next_power_of_two())
+}
+
+/// A list is done with `buffers`: kept for the next list, or freed past
+/// [`UPLOAD_SPARE_MOST`].
+fn give_uploads(buffers: Vec<(Pooled, u64)>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let mut spare = UPLOAD_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in buffers {
+            if let Some(back) = spare.give(buffer, size, UPLOAD_SPARE_MOST) {
+                freed.push(back);
+            }
+        }
+    }
+    // Freed outside the lock.
+    drop(freed);
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
@@ -1896,8 +2113,12 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
-    /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
+    /// The bytes of `uploads` and `pooled` (counted in [`ALIVE`] while they
+    /// are held).
     upload_bytes: u64,
+    /// Upload buffers from [`UPLOAD_SPARE`] and their size class, given
+    /// back when the list is done.
+    pooled: Vec<(Pooled, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1934,12 +2155,22 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Holds `buffer` (of size class `size`) until the list is reset, then
+    /// gives it back to [`UPLOAD_SPARE`].
+    fn hold_pooled(&mut self, buffer: Pooled, size: u64) {
+        ALIVE[6].fetch_add(1, Ordering::Relaxed);
+        ALIVE[7].fetch_add(size, Ordering::Relaxed);
+        self.upload_bytes += size;
+        self.pooled.push((buffer, size));
+    }
 }
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[6].fetch_sub((self.uploads.len() + self.pooled.len()) as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        give_uploads(std::mem::take(&mut self.pooled));
     }
 }
 
@@ -5471,6 +5702,7 @@ impl Host {
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -5483,12 +5715,30 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        ended = wait_for_submission(
+                            || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                            || self.device.GetDeviceRemovedReason().is_err(),
+                            |secs| {
+                                tracing::warn!(secs, lists = runs.len(), "host submission still on the GPU");
+                            },
+                        );
                         stood(started);
                         working(true);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            match ended {
+                Waited::Done => {}
+                // Nothing more runs on a removed device; reported below.
+                Waited::Removed => break,
+                Waited::Stalled => fail(format_args!(
+                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                     names a fault){}",
+                    runs.len(),
+                    last_notes(runs)
+                )),
             }
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
@@ -6348,6 +6598,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.pooled.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -6446,11 +6697,24 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of at least `size` bytes, alive until the
+    /// list is reset: one kept from an earlier list ([`upload_pool`]) or a
+    /// new one. What it held before is still there.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(class) = upload_class(size) {
+            let kept = UPLOAD_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(class);
+            let pooled = match kept {
+                Some(pooled) => pooled,
+                None => {
+                    let (buffer, data) = host.upload_buffer(class)?;
+                    name(&buffer, || format!("list upload {class:#x} (pooled)"));
+                    Pooled { buffer, data: data as usize }
+                }
+            };
+            let out = (pooled.buffer.clone(), pooled.data as *mut u8);
+            self.deferred().hold_pooled(pooled, class);
+            return Some(out);
+        }
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);

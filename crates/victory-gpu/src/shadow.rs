@@ -75,8 +75,9 @@ pub(crate) struct Shadow {
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
-    /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// begins on a 64 KiB line; a title buffer need not), and the
+    /// page-pool section it lies in, if any (`crate::inplace::Placed`).
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, Option<usize>)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2003,9 +2004,9 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if self.place.is_some() {
+        if let Some(place) = &self.place {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, place.2);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2346,7 +2347,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.pooled));
         shadow
     }
 
@@ -2740,7 +2741,7 @@ impl Shadow {
         }
         OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
         let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 16384 == 0 {
+        if n.is_multiple_of(16384) {
             tracing::info!(
                 "what shaders wrote, stored through views of our own (VICTORY_BACK_OWN_VIEW=1), since the start: {n} stretches {} MB, {} pages noted current for the copy that wrote them (not copied in again), {} stretches written the old way",
                 OWN_WRITES[1].load(Ordering::Relaxed) >> 20,
