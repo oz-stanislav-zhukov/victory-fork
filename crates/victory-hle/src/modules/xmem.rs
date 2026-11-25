@@ -536,6 +536,45 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Title addresses that show slices `[slice.index, slice.index + n)` of
+/// `slice.section` now, as `(address, length)`: one per mapped view that
+/// holds some of them.
+fn shown_at(physical: &Physical, slice: &Slice, n: usize) -> Vec<(usize, usize)> {
+    let (first, end) = (slice.index, slice.index + n);
+    physical
+        .views
+        .iter()
+        .filter_map(|(&at, (len, view))| {
+            if !Arc::ptr_eq(&view.section, &slice.section) {
+                return None;
+            }
+            let (view_first, view_end) = (view.index, view.index + len / PAGE);
+            let (a, b) = (first.max(view_first), end.min(view_end));
+            (a < b).then(|| (at + (a - view_first) * PAGE, (b - a) * PAGE))
+        })
+        .collect()
+}
+
+/// After we wrote into physical pages through a view of our own: the title
+/// addresses that show them changed with no write there, which the host
+/// copies' write tracking cannot see (a guarded block only faults for a
+/// write at its own address). Told like a kernel write, so the copies of
+/// that memory are refreshed. Without this, models streamed in by
+/// DirectStorage into pages the title had mapped before kept their old
+/// bytes in the copies (fork issue #62: the first room's walls and ceiling
+/// missing until every copy was refreshed whole).
+fn written(runs: &[(Slice, usize)]) {
+    let shown: Vec<(usize, usize)> = {
+        let physical = physical();
+        runs.iter()
+            .flat_map(|(slice, n)| shown_at(&physical, slice, *n))
+            .collect()
+    };
+    for (at, len) in shown {
+        victory_gpu::kernel_will_write(at, len);
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -546,24 +585,37 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
+    let mut whole = true;
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
-            return false;
+            whole = false;
+            break;
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
     }
-    true
+    // After the bytes are in (a copy taken between the write and this
+    // sees them anyway), and also when only some runs were written.
+    written(&runs);
+    whole
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
-/// would then copy.
+/// would then copy. Dropping it tells the title addresses that show the
+/// pages that they changed ([`written`]).
 pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    run: (Slice, usize),
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        written(std::slice::from_ref(&self.run));
+    }
 }
 
 impl PageWindow {
@@ -587,6 +639,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
+        run: (slice.clone(), *n),
     })
 }
 
@@ -1320,5 +1373,59 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// A write into physical pages finds every title address that shows
+    /// them (fork issue #62): the pages' own view, an alias of one of them
+    /// elsewhere, and nothing for pages of another allocation.
+    #[test]
+    fn pages_written_are_found_at_every_address_that_shows_them() {
+        let (pages, other) = (allocate(3), allocate(1));
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve() as usize, reserve() as usize);
+        assert!(a != 0 && b != 0);
+        assert_eq!(
+            XMemMapPhysicalPages(a as *mut c_void, 3, pages.as_ptr()),
+            a as *mut c_void
+        );
+        let alias = (b + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(alias, 1, pages[2..].as_ptr()), alias);
+        let shown = |page_list: &[usize], offset, len| {
+            let runs = runs(page_list, offset, len).expect("known pages");
+            let physical = physical();
+            let mut all: Vec<(usize, usize)> = runs
+                .iter()
+                .flat_map(|(s, n)| shown_at(&physical, s, *n))
+                .collect();
+            all.sort_unstable();
+            all
+        };
+        // Pages 1 and 2: in the view at `a`, and page 2 again at `b + PAGE`.
+        let mut want = vec![(a + PAGE, 2 * PAGE), (b + PAGE, PAGE)];
+        want.sort_unstable();
+        assert_eq!(shown(&pages[1..], 10, PAGE + 20), want);
+        // Page 0 only at `a`.
+        assert_eq!(shown(&pages[..1], 0, 1), vec![(a, PAGE)]);
+        // A page mapped nowhere is shown nowhere.
+        assert_eq!(shown(&other, 0, PAGE), vec![]);
+        // Unmapped again: nowhere.
+        assert_eq!(
+            XMemMapPhysicalPages(a as *mut c_void, 3, std::ptr::null()),
+            a as *mut c_void
+        );
+        assert_eq!(XMemMapPhysicalPages(alias, 1, std::ptr::null()), alias);
+        assert_eq!(shown(&pages, 0, 3 * PAGE), vec![]);
+        // The writes still go through (and tell nobody).
+        assert!(write_physical(&pages, 0, &[1, 2, 3]));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
     }
 }
