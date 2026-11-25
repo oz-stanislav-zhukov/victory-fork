@@ -4773,11 +4773,11 @@ impl<'a> Lower<'a> {
             Some(Rmw::Sub) if !matches!(v0, V::Const(_)) => Some(v0),
             _ => None,
         };
-        let r = match rmw {
-            _ if let Some(x) = take => self.lds_rmw_loop(p, |l, old| l.s.m.bin(l.cur, Bin::Sub, old, x)),
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        let r = match (rmw, take) {
+            (_, Some(x)) => self.lds_rmw_loop(p, |l, old| l.s.m.bin(l.cur, Bin::Sub, old, x)),
+            (Some(op), None) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
+            (None, None) => self
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
