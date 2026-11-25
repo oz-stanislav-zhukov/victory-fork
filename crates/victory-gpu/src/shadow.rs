@@ -2395,7 +2395,8 @@ impl Shadow {
         if !full && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let mut copied = self.copy_stale(from, to, now, &written);
+                copied += self.stale_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2414,6 +2415,67 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// `VICTORY_STALE_CHECK=1` (diagnostic, off by default; costs about as
+    /// much as `VICTORY_FULL_REFRESH`): after the tracked refresh of
+    /// `[from, to)`, compares the copy with title memory page by page and
+    /// logs the buffers whose copy differs although the tracking saw no
+    /// write (fork issue #62), then copies those pages. Returns the bytes
+    /// copied.
+    fn stale_check(&self, from: usize, to: usize) -> usize {
+        // 1: every copy; 2: only copies not kept in the card's memory
+        // (repairing those clobbers what shaders wrote on the card side).
+        static CHECK: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let check = *CHECK.get_or_init(|| match std::env::var("VICTORY_STALE_CHECK").as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        });
+        if check == 0 || (check == 2 && self.card.is_some()) {
+            return 0;
+        }
+        static SEEN: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+        let start = self.start as usize;
+        let mut now = vec![0u8; PAGE];
+        let (mut pages, mut first, mut bytes) = (0usize, None, 0usize);
+        let mut by_copy_memory = 0usize;
+        let mut at = from;
+        while at < to {
+            let end = ((at / PAGE + 1) * PAGE).min(to);
+            let n = end - at;
+            crate::host::copy_mapped(now.as_mut_ptr(), at as *const u8, n, false);
+            // SAFETY: inside the mapping (`at..end` is within the buffer).
+            let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start), n) };
+            if copy != &now[..n] {
+                pages += 1;
+                first.get_or_insert(at - start);
+                if recent_cpu_copy(at, end) {
+                    by_copy_memory += 1;
+                }
+                bytes += self.copy(at, end);
+            }
+            at = end;
+        }
+        if pages > 0 {
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            let times = seen.entry(self.start).or_insert(0);
+            *times += 1;
+            if times.is_power_of_two() {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    stale_pages = pages,
+                    first = first.unwrap_or(0),
+                    times = *times,
+                    carded = self.card.is_some(),
+                    mapped = is_mapped(self.start as usize),
+                    by_copy_memory,
+                    "stale copy: title memory differs from the copy where the write tracking saw no write"
+                );
+            }
+        }
+        bytes
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -3189,4 +3251,37 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Diagnostics for `VICTORY_STALE_CHECK`: title memory the runtime wrote on
+/// the CPU for `CopyMemoryToMemoryX` lately, to tell whether a stale copy
+/// came from such a write.
+static CPU_COPIES: Mutex<std::collections::VecDeque<(usize, usize)>> = Mutex::new(std::collections::VecDeque::new());
+
+/// `CopyMemoryToMemoryX` wrote `[at, at + len)` (kept only while
+/// `VICTORY_STALE_CHECK` is set).
+pub(crate) fn note_cpu_copy(at: usize, len: usize) {
+    if std::env::var_os("VICTORY_STALE_CHECK").is_none() {
+        return;
+    }
+    let mut q = CPU_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back((at, at + len));
+    while q.len() > 65536 {
+        q.pop_front();
+    }
+}
+
+fn recent_cpu_copy(from: usize, to: usize) -> bool {
+    CPU_COPIES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+}
+
+/// Whether `at` is in a mapped view (physical pages) rather than private
+/// memory.
+fn is_mapped(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.Type == MEM_MAPPED
 }

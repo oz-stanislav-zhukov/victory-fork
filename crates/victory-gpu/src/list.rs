@@ -1301,6 +1301,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             {
                 // SAFETY: both ranges are committed title memory.
                 unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                crate::shadow::note_cpu_copy(dst as usize, len);
             }
         });
     }
