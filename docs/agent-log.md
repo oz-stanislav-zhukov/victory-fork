@@ -47,3 +47,11 @@ SHADER_OPT=0 BVH_BUILDER=1 BVH_QUARANTINE=1 RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD
 - Candidate PRs next: #294/#354/#156 (BVH builder last 3 progs on 32-lane => dynamic shadows), #346 (shader stores by address mark their copy, #284), #363 #240 #255 #384 (copy/copy-back perf), #23 (gameinput history for low fps), #285 (black window before 1st present), #414/#230/#213 (BVH absent child).
    - #115 crash already reported by SantannaCarlos (same int3 +0x23d8f03): DirectStorage kernel read into a destination that #115 made read-only -> ERROR_INVALID_USER_BUFFER 0x800706f8 -> title stops. Also joroyt's fix for #115 protect noting aliases clean: Spexivus/victory-fork#1 (0bcc069) — with it room comes back (their RTX 4070). SantannaCarlos writing hold-open fix for kernel_will_write. Our confirming comment: #115 issuecomment-7148875270. When their fix lands: test #115 + 0bcc069 + hold-open.
    - runN screenshot: 4 fps 270 ms at window; blue band at bottom STILL there with #51 => #51 not the cause of the band.
+
+## jman-picks (branch from fork-prs, 2026-11-25)
+- JMAN730/victory = JMAN730/project-flamingo (renamed). Base ffe310e, 471 non-merge commits: 189 apply clean on fork-prs, 247 conflict.
+- Picked 131 clean non-doc/CI commits (shader lowering, sRGB/linear views, sampler fixes, null CBV, RTV only for RT textures, A8 typeless, f32_to_half, late flip wait, thin LTO, XAsync/XMA/loader fixes).
+- Reverted picks: 9801045 (needs Kept enum), 5f418f2+7183336 (APU tests fail), 1eb3d0a (Win10 token workaround; dup of our #22), e1b8f12 (clzero emulation off by 28 bytes in its test). e4a0f0e, b61b934 did not apply.
+- Fixes: Instruction::new (270302d vs branch folding), quota parse type, test call sites.
+- lib tests green: shader, formats, hle, pe, loader, pipeline, gpu. ❓ not run in game yet.
+- Next candidates (conflict / open PRs): #583 wave64 own-bits (compare with our own_bits.rs), #574 ReBAR upload heaps (copy perf), streamed mips #576, epoch retirement, adapter by SM6.6, issue #331 = Win10 19045 + RTX 5060 report.
