@@ -106,6 +106,14 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Make the shader translations and host pipelines that earlier runs
+    /// drew with (their recipes in the cache) without the title: run after
+    /// a rebuild, with the same VICTORY_* switches as the game.
+    Warm {
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -172,8 +180,46 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Warm { jobs } => warm(jobs),
         Command::Config => show_config(),
     }
+}
+
+#[cfg(windows)]
+fn warm(jobs: Option<usize>) -> Result<()> {
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let jobs = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
+    let started = std::time::Instant::now();
+    let shown = std::sync::Mutex::new(std::time::Instant::now());
+    let w = victory_hle::modules::d3d12x::warm_pipelines(jobs, &|done, total| {
+        let mut last = shown.lock().unwrap_or_else(|e| e.into_inner());
+        if done == total || last.elapsed().as_secs() >= 10 {
+            *last = std::time::Instant::now();
+            println!(
+                "warm  {done}/{total} pipelines  {:.0} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    });
+    println!(
+        "warm  {} recipes: {} with a host pipeline, {} refused or untranslated, {} unreadable, {} under another key; {:.0} s",
+        w.recipes,
+        w.made,
+        w.refused,
+        w.unreadable,
+        w.other_key,
+        started.elapsed().as_secs_f64()
+    );
+    if w.recipes == 0 {
+        println!("warm  no recipes yet: a run of the game writes them as it draws");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn warm(_jobs: Option<usize>) -> Result<()> {
+    anyhow::bail!("warm needs the host's D3D12")
 }
 
 fn show_config() -> Result<()> {

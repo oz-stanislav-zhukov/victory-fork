@@ -49,6 +49,12 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Makes the host pipelines of the recipes earlier runs wrote (`victory warm`).
+#[cfg(windows)]
+pub fn warm_pipelines(jobs: usize, progress: &(dyn Fn(usize, usize) + Sync)) -> victory_gpu::pipeline::Warmed {
+    victory_gpu::pipeline::warm(jobs, progress)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

@@ -694,6 +694,20 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod recipe;
+#[cfg(windows)]
+pub use recipe::Warmed;
+
+/// Makes the host pipeline (and translations) of every pipeline recipe in
+/// the pipeline cache, with `jobs` threads, and saves the library: what the
+/// next run would otherwise make in the world (`recipe`).
+#[cfg(windows)]
+pub fn warm(jobs: usize, progress: &(dyn Fn(usize, usize) + Sync)) -> Warmed {
+    // The host device first: translation reads its wave size and view limit.
+    let _ = crate::host::host();
+    recipe::warm(jobs, progress)
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

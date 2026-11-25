@@ -267,6 +267,161 @@ impl GraphicsState {
         )
     }
 
+    /// The state as bytes for a pipeline recipe (`library::note_recipe`),
+    /// field by field so that [`decode`](Self::decode) gives back a state
+    /// whose [`describe`](Self::describe) is the same, and so the same key.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::default();
+        let b = &self.blend;
+        w.i(b.AlphaToCoverageEnable.0);
+        w.i(b.IndependentBlendEnable.0);
+        for t in &b.RenderTarget {
+            for v in [
+                t.BlendEnable.0,
+                t.LogicOpEnable.0,
+                t.SrcBlend.0,
+                t.DestBlend.0,
+                t.BlendOp.0,
+                t.SrcBlendAlpha.0,
+                t.DestBlendAlpha.0,
+                t.BlendOpAlpha.0,
+                t.LogicOp.0,
+            ] {
+                w.i(v);
+            }
+            w.u(u32::from(t.RenderTargetWriteMask));
+        }
+        w.u(self.sample_mask);
+        let r = &self.rasterizer;
+        w.i(r.FillMode.0);
+        w.i(r.CullMode.0);
+        w.i(r.FrontCounterClockwise.0);
+        w.i(r.DepthBias);
+        w.u(r.DepthBiasClamp.to_bits());
+        w.u(r.SlopeScaledDepthBias.to_bits());
+        w.i(r.DepthClipEnable.0);
+        w.i(r.MultisampleEnable.0);
+        w.i(r.AntialiasedLineEnable.0);
+        w.u(r.ForcedSampleCount);
+        w.i(r.ConservativeRaster.0);
+        let d = &self.depth;
+        w.i(d.DepthEnable.0);
+        w.i(d.DepthWriteMask.0);
+        w.i(d.DepthFunc.0);
+        w.i(d.StencilEnable.0);
+        w.u(u32::from(d.StencilReadMask));
+        w.u(u32::from(d.StencilWriteMask));
+        for f in [&d.FrontFace, &d.BackFace] {
+            w.i(f.StencilFailOp.0);
+            w.i(f.StencilDepthFailOp.0);
+            w.i(f.StencilPassOp.0);
+            w.i(f.StencilFunc.0);
+        }
+        w.u(self.inputs.len() as u32);
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            w.bytes(name.as_bytes());
+            w.u(e.SemanticIndex);
+            w.i(e.Format.0);
+            w.u(e.InputSlot);
+            w.u(e.AlignedByteOffset);
+            w.i(e.InputSlotClass.0);
+            w.u(e.InstanceDataStepRate);
+        }
+        w.i(self.strip_cut.0);
+        w.i(self.topology.0);
+        for f in &self.targets.RTFormats {
+            w.i(f.0);
+        }
+        w.u(self.targets.NumRenderTargets);
+        w.i(self.depth_format.0);
+        w.u(self.samples.Count);
+        w.u(self.samples.Quality);
+        w.0
+    }
+
+    /// The state [`encode`](Self::encode) wrote; `None` for bytes it did not write.
+    pub(crate) fn decode(bytes: &[u8]) -> Option<GraphicsState> {
+        let mut r = Reader(bytes);
+        let mut g = GraphicsState::default();
+        let b = &mut g.blend;
+        b.AlphaToCoverageEnable.0 = r.i()?;
+        b.IndependentBlendEnable.0 = r.i()?;
+        for t in &mut b.RenderTarget {
+            t.BlendEnable.0 = r.i()?;
+            t.LogicOpEnable.0 = r.i()?;
+            t.SrcBlend.0 = r.i()?;
+            t.DestBlend.0 = r.i()?;
+            t.BlendOp.0 = r.i()?;
+            t.SrcBlendAlpha.0 = r.i()?;
+            t.DestBlendAlpha.0 = r.i()?;
+            t.BlendOpAlpha.0 = r.i()?;
+            t.LogicOp.0 = r.i()?;
+            t.RenderTargetWriteMask = u8::try_from(r.u()?).ok()?;
+        }
+        g.sample_mask = r.u()?;
+        let ra = &mut g.rasterizer;
+        ra.FillMode.0 = r.i()?;
+        ra.CullMode.0 = r.i()?;
+        ra.FrontCounterClockwise.0 = r.i()?;
+        ra.DepthBias = r.i()?;
+        ra.DepthBiasClamp = f32::from_bits(r.u()?);
+        ra.SlopeScaledDepthBias = f32::from_bits(r.u()?);
+        ra.DepthClipEnable.0 = r.i()?;
+        ra.MultisampleEnable.0 = r.i()?;
+        ra.AntialiasedLineEnable.0 = r.i()?;
+        ra.ForcedSampleCount = r.u()?;
+        ra.ConservativeRaster.0 = r.i()?;
+        let d = &mut g.depth;
+        d.DepthEnable.0 = r.i()?;
+        d.DepthWriteMask.0 = r.i()?;
+        d.DepthFunc.0 = r.i()?;
+        d.StencilEnable.0 = r.i()?;
+        d.StencilReadMask = u8::try_from(r.u()?).ok()?;
+        d.StencilWriteMask = u8::try_from(r.u()?).ok()?;
+        for f in [&mut d.FrontFace, &mut d.BackFace] {
+            f.StencilFailOp.0 = r.i()?;
+            f.StencilDepthFailOp.0 = r.i()?;
+            f.StencilPassOp.0 = r.i()?;
+            f.StencilFunc.0 = r.i()?;
+        }
+        let n = r.u()? as usize;
+        if n > 64 {
+            return None;
+        }
+        let mut elements = Vec::with_capacity(n);
+        for _ in 0..n {
+            g.names.push(CString::new(r.bytes()?).ok()?);
+            elements.push(D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR::null(),
+                SemanticIndex: r.u()?,
+                Format: DXGI_FORMAT(r.i()?),
+                InputSlot: r.u()?,
+                AlignedByteOffset: r.u()?,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(r.i()?),
+                InstanceDataStepRate: r.u()?,
+            });
+        }
+        // The names live in `g.names`, whose buffers do not move with it.
+        g.inputs = elements
+            .into_iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..e
+            })
+            .collect();
+        g.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(r.i()?);
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(r.i()?);
+        for f in &mut g.targets.RTFormats {
+            f.0 = r.i()?;
+        }
+        g.targets.NumRenderTargets = r.u()?;
+        g.depth_format = DXGI_FORMAT(r.i()?);
+        g.samples.Count = r.u()?;
+        g.samples.Quality = r.u()?;
+        r.0.is_empty().then_some(g)
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -902,12 +1057,90 @@ fn root_signature(
     }
 }
 
+/// Little-endian words and length-prefixed bytes, for recipes.
+#[derive(Default)]
+pub(crate) struct Writer(pub(crate) Vec<u8>);
+
+impl Writer {
+    pub(crate) fn u(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    pub(crate) fn i(&mut self, v: i32) {
+        self.u(v as u32);
+    }
+    pub(crate) fn bytes(&mut self, b: &[u8]) {
+        self.u(b.len() as u32);
+        self.0.extend_from_slice(b);
+    }
+}
+
+/// Reads what [`Writer`] wrote.
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
+
+impl<'a> Reader<'a> {
+    pub(crate) fn u(&mut self) -> Option<u32> {
+        let (head, rest) = self.0.split_first_chunk::<4>()?;
+        self.0 = rest;
+        Some(u32::from_le_bytes(*head))
+    }
+    pub(crate) fn i(&mut self) -> Option<i32> {
+        self.u().map(|v| v as i32)
+    }
+    pub(crate) fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.u()? as usize;
+        if n > self.0.len() {
+            return None;
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Some(head)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// A recipe's state decodes to one that describes itself the same,
+    /// input names included, and other bytes are refused.
+    #[test]
+    fn graphics_state_round_trips_through_its_recipe_bytes() {
+        let mut g = GraphicsState::default();
+        g.blend.RenderTarget[2].BlendEnable = true.into();
+        g.blend.RenderTarget[2].RenderTargetWriteMask = 0x5;
+        g.rasterizer.DepthBiasClamp = -0.25;
+        g.depth.StencilReadMask = 0x3c;
+        g.names = vec![CString::new("POSITION").unwrap(), CString::new("TEXCOORD").unwrap()];
+        g.inputs = g
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(n.as_ptr().cast()),
+                SemanticIndex: i as u32,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 12 * i as u32,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            })
+            .collect();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        let bytes = g.encode();
+        let back = GraphicsState::decode(&bytes).expect("decodes");
+        assert_eq!(back.describe(), g.describe());
+        // SAFETY: the names point into `back.names`.
+        let name = unsafe { CStr::from_ptr(back.inputs[1].SemanticName.0.cast()) };
+        assert_eq!(name.to_str(), Ok("TEXCOORD"));
+        assert!(GraphicsState::decode(&bytes[..bytes.len() - 1]).is_none());
+        assert!(GraphicsState::decode(&[bytes.as_slice(), &[0]].concat()).is_none());
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
@@ -1044,3 +1277,4 @@ mod tests {
         assert_eq!(host_blend(&blending(false), &t), blending(false));
     }
 }
+
