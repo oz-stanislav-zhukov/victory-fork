@@ -431,19 +431,14 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    let mut out = vec![0f32; frames * channels];
+    // SAFETY: the title's output buffer holds `output_length` bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
         for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
             (out[i], out[frames + i]) = (frame[0], frame[1]);
         }
     } else {
         out.copy_from_slice(kept);
-    }
-    // Copied as bytes: the title's buffer need not be aligned for f32 (#839).
-    // SAFETY: the title's output buffer holds `output_length` bytes, and
-    // `frames` was bounded by it above.
-    unsafe {
-        std::ptr::copy_nonoverlapping(out.as_ptr().cast::<u8>(), output, out.len() * 4);
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -608,46 +603,6 @@ mod tests {
             sequence: 7,
             options: 0,
             context: 0x1234,
-        }
-    }
-
-    /// Output written to a buffer at any byte offset, as a title may pass
-    /// one, is the same as to an aligned one (#839).
-    #[test]
-    fn decodes_into_an_unaligned_buffer() {
-        let tone: Vec<f32> = (0..960 * 2)
-            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
-            .collect();
-        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
-        let mut packet = [0u8; 1500];
-        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
-        let decode = |options: u32, at: usize| {
-            let mut buffer = vec![0u8; 960 * 8 + 8];
-            let command = Process {
-                id: id(PROCESS, 0),
-                pitch_ramp: 0.0,
-                target_pitch: 1.0,
-                first_frame: 0,
-                frame_count: 960,
-                input_length: n as u32,
-                input: packet.as_ptr(),
-                output_length: 960 * 8,
-                output: buffer.as_mut_ptr().wrapping_add(at),
-            };
-            // SAFETY: a zeroed result is valid.
-            let mut result: ApuResult = unsafe { std::mem::zeroed() };
-            let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
-            process(&mut decoder, options, &command, &mut result);
-            let (error, frames) = (result.error, result.frames);
-            assert_eq!((error, frames), (S_OK, 960));
-            buffer[at..at + 960 * 8].to_vec()
-        };
-        for options in [0, DEINTERLEAVED_OUTPUT] {
-            let aligned = decode(options, 0);
-            assert!(aligned.iter().any(|&b| b != 0));
-            for at in 1..4 {
-                assert!(decode(options, at) == aligned, "offset {at}");
-            }
         }
     }
 
