@@ -14,7 +14,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
-| Z6 | fork-rays (+#148) | builder OFF, `TEXTURE_GUARD=0` | 3-4 (median 3.4) | 243-385 | bright again; corridor walls normal (were black in Z4); waitress face STILL rainbow; Lucia eyes glow; orange 8x8 blocks on Lucia's hair in common room | fork-rays = new base. Guard is not the skin noise |
+| Z6 | fork-rays (+#148) | builder OFF, `TEXTURE_GUARD=0` | 3-4 (median 3.4); hall 2 | 243-385; hall 443 (9.6k draws) | bright again; corridor walls normal (were black in Z4); waitress face STILL rainbow; Lucia eyes glow; orange 8x8 blocks on Lucia's hair in common room | fork-rays = new base. Guard is not the skin noise |
 | Z5 | fork-rays | #993+#994, builder ON | 2.4-3.0 | 335-460 | much darker, GPU ~270 ms, copy-back ~280 ms | builder runs without crash, but rays not worth it yet |
 | Z4 | fork-pool | +#959 | 3.7-4.1 | 244-273 | corridor walls black + white patches; skin speckle | no crash in 10+ min |
 | Z3 | fork-shade | ambient shade (depth AO) | 3-4 | 258-300 | corners/joints darker, less flat | kept |
@@ -27,6 +27,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | Hypothesis | Test | Result |
 |---|---|---|
 | Skin rainbow speckle = stale textures the texture guard misses | Z6 with `VICTORY_TEXTURE_GUARD=0` (hash every check) | REFUTED: waitress face still speckled. Look at the skin shader instead |
+| `VICTORY_TEXTURE_GUARD=0` is free (fxceless#652: "not slower") | Z6 vs Z4 frame lines | FALSE here: textures 41-51 ms / 170-220 MB a frame vs 6-26 ms / 25-85 MB; preparing 135-144 vs 72-95 ms; cell 3.2-3.6 vs 4.0-5.3 fps; big hall (9.6k draws) 2 fps. Keep the guard ON |
 | Black corridor walls = strong ambient AO | Z4, AO back to default | REFUTED (walls stayed black). Walls fine in Z6 (guard off and/or #148/#994): not yet split which |
 | Darkness with builder on = ambient switched off | Z5 log `ambient ... shaded=true` | REFUTED: ambient on; ray passes occlude it |
 | Builder crash at world entry (0xffff... read) | Z5 with #994 | FIXED by #994 (thread-count dispatches) |
