@@ -394,3 +394,16 @@ mod tests {
         super::make(&host.device).expect("the ambient pass");
     }
 }
+
+/// Counts for the log: resolves seen after a direct dispatch (0), of them
+/// with their image replaced (1), and resolves run indirectly, whose image
+/// is not replaced (2). Logged every 2,000 resolves seen or run indirectly.
+pub(crate) fn count(which: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let n = N[which].fetch_add(1, Ordering::Relaxed) + 1;
+    if which != 1 && n.is_multiple_of(2000) {
+        let [seen, raised, indirect] = [0, 1, 2].map(|i| N[i].load(Ordering::Relaxed));
+        tracing::info!(seen, raised, indirect, "ambient light: resolves seen, replaced, run indirectly (not replaced)");
+    }
+}

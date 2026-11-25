@@ -2318,6 +2318,7 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
+        crate::ambient::count(0);
         let (slot, offset) = crate::ambient::LIGHT;
         let Some(u) = stage.translated().used.iter().find(|u| {
             u.kind == ResourceType::Uav
@@ -2351,7 +2352,11 @@ impl State {
             Some(View::Shader(r, _)) => Some(r as This),
             _ => None,
         };
-        crate::ambient::raise(list, light as This, depth)
+        let raised = crate::ambient::raise(list, light as This, depth);
+        if raised {
+            crate::ambient::count(1);
+        }
+        raised
     }
 
     /// A dispatch by thread counts (`DispatchX` with the console's
@@ -3430,6 +3435,10 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            // The resolve run indirectly: its image is not replaced.
+            if p.stages.first().is_some_and(|s| s.shader.resolves_light) {
+                crate::ambient::count(2);
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
