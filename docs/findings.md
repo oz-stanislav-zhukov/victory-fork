@@ -33,6 +33,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | Black walls are time-dependent (degrade later in a run) | Z6, user | REFUTED: in Z6 the cell-block corridor stays fine all run (was black in Z4); the big common hall (A102/A103, first mission) is black with white patches. Area/material dependent. Corridor fix in Z6 = guard off, #148 or #994 (not yet split) |
 | Darkness with builder on = ambient switched off | Z5 log `ambient ... shaded=true` | REFUTED: ambient on; ray passes occlude it |
 | Builder crash at world entry (0xffff... read) | Z5 with #994 | FIXED by #994 (thread-count dispatches) |
+| Which change fixed the black walls | Z4 (guard on, no #148/#994): corridor black. Z6 (guard OFF, +#148/#994): corridor fine, hall black. Z7 (guard on, +#148/#994): corridor AND hall fine | SETTLED: #148 or #994 fixed the corridor; guard OFF caused the black hall in Z6. Keep guard on. Hall with 10-11k draws: 3 fps / 316-342 ms in Z7 vs 2 fps / 443 ms in Z6 |
 | #2473 (Marvisak) affects us | code read | NO: needs `VICTORY_REFRESH_ONCE=1`, off here |
 | #2414 (Marvisak) affects us | code read | NO: our fxceless watch.rs has no alias-following `changed` |
 | JMAN da125a4 (sampler mip-none) | runs | HARMFUL: whole image blurry; reverted |
@@ -60,7 +61,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 2. Lucia's eyes glow white/blue in close-ups. Qwen report 02: same #934 (v_interp_p2_f16 drops clamp/omod: values >1 blow out white); #948/#1019/#927 unlikely. Test on fork-skin.
 2b. Z7: guard's forearms fully rainbow at door B35 (face clean): skin noise is per shader variant, not per run.
 3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
-4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
+4. Orange 8x8 blocks on Lucia's hair (common room, Z6); Z7: blocky squares over the hall ceiling, lamps and windows in one shot (light/volumetric pass tiles?).
 5. Rays: builder runs but darkens the image and doubles GPU time.
 6. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
 
