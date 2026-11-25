@@ -64,3 +64,4 @@ SHADER_OPT=0 BVH_BUILDER=1 BVH_QUARANTINE=1 RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD
 - runW (fork-speed = fork-wave + #857 + #853, BVH_BUILDER=0): no crash. Cell ~6k draws: 285-330 ms/frame, copy-back ~180-190 (runV ~205), prep 86-155, GPU 172-185. ⚠️ ~5-10% at best, within scene noise: #857 targets Wine (NtWriteVirtualMemory 4 µs), native Win10 writes are cheap. Not the copy-back fix we need.
 - Waitress face rainbow speckle STILL there (bar) -> Belobug helper-lane quad fix does not cure it. Lucia close-up: eyes glow white/purple (new or old? earlier "black eyes"). Bottom blocky band still.
 - Posted update to fxceless#148 (comment 7162173259): ceiling on a26859f, #854 (0 untranslated/refused, builder crash -> #16), #857/#853 ~no gain on Windows, da125a4 warning.
+- #148 title updated (ceiling on a26859f, 2.9-3.5 fps, stable w/o builder).
