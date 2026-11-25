@@ -10,8 +10,6 @@
 
 #[cfg(windows)]
 pub mod apu;
-/// Portable sample-rate conversion used by the Windows-gated APU.
-pub(crate) mod apu_resample;
 pub mod audio;
 pub mod d3d12x;
 pub mod display;
