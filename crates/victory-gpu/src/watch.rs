@@ -306,6 +306,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    take_alias_writes(j);
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -571,8 +572,47 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // The same pages at other addresses changed too: noted for the
+        // journal, not guarded (guarding them cost frames and broke draws).
+        note_alias_writes(block);
     }
     !blocks.is_empty()
+}
+
+/// Pages at other addresses written through an alias (the title maps its
+/// physical memory twice): [`writes`] puts them in the journal at its next
+/// asking. Not the journal itself: [`open`] runs under the guards' lock,
+/// which the journal's holders take after the journal.
+static ALIAS_WRITES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn note_alias_writes(block: usize) {
+    let aliases = crate::inplace::aliases(block * BLOCK, BLOCK);
+    if aliases.is_empty() {
+        return;
+    }
+    let mut pages = ALIAS_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    for (at, len) in aliases {
+        pages.extend(at / PAGE..(at + len).div_ceil(PAGE));
+    }
+    static NOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(blocks = n, "write tracking: writes noted at another address of the same pages");
+    }
+}
+
+/// Moves the alias writes noted since into the journal as a new asking, so
+/// every copy taken before it copies those pages again.
+fn take_alias_writes(j: &mut Journal) {
+    let pages = std::mem::take(&mut *ALIAS_WRITES.lock().unwrap_or_else(|e| e.into_inner()));
+    if pages.is_empty() {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in pages {
+        j.written.insert(page, now);
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the

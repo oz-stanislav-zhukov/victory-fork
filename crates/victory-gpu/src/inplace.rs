@@ -269,9 +269,27 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// The same views by section, then by (offset, address): length; and
+    /// each section's longest view, which bounds a search by offset
+    /// ([`aliases`], asked at every write fault).
+    by_section: BTreeMap<usize, (BTreeMap<(u64, usize), usize>, usize)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views {
+    views: BTreeMap::new(),
+    sections: Vec::new(),
+    by_section: BTreeMap::new(),
+});
+
+impl Views {
+    fn forget(&mut self, at: usize) {
+        if let Some((_, section, offset)) = self.views.remove(&at)
+            && let Some((index, _)) = self.by_section.get_mut(&section)
+        {
+            index.remove(&(offset, at));
+        }
+    }
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -288,7 +306,43 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let mut v = views();
+    v.forget(at);
+    v.views.insert(at, (len, section, offset));
+    let (index, longest) = v.by_section.entry(section).or_default();
+    index.insert((offset, at), len);
+    *longest = (*longest).max(len);
+}
+
+/// The other title addresses that show the bytes of `[at, at + len)`: the
+/// same pages of the same section in another view, as `(address, length)`.
+/// The title maps its physical memory twice, as one large view and as some
+/// 130,000 small ones, and hands the GPU addresses from both: a write at one
+/// is a write at the other, which the other's copies do not see.
+pub(crate) fn aliases(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let v = views();
+    let Some((&base, &(view_len, section, offset))) = v.views.range(..=at).next_back() else {
+        return Vec::new();
+    };
+    if base + view_len <= at {
+        return Vec::new();
+    }
+    let from = offset + (at - base) as u64;
+    let to = from + len.min(base + view_len - at) as u64;
+    let Some((index, longest)) = v.by_section.get(&section) else {
+        return Vec::new();
+    };
+    let low = from.saturating_sub(*longest as u64);
+    index
+        .range((low, 0)..(to, 0))
+        .filter_map(|(&(other_offset, other), &other_len)| {
+            if other == base {
+                return None;
+            }
+            let (a, e) = (from.max(other_offset), to.min(other_offset + other_len as u64));
+            (a < e).then(|| (other + (a - other_offset) as usize, (e - a) as usize))
+        })
+        .collect()
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -303,7 +357,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        v.forget(base);
     }
 }
 
