@@ -11,3 +11,6 @@ Launch: `F:\Work\victory-fork\target-main\release\victory.exe run 'F:\gta6\GTA6.
 
 Conclusions: darkness in Z9 = one of `BACK_OWN_VIEW` / `JOIN_PARTS` / `INDIRECT_GATHER`. Fast copy-back comes from `QUEUE2`+`ASYNC_SUBMIT` (Z10 has it without BACK_OWN_VIEW). Z10's slow GPU likely `RELAY=2` instead of `RELAY=1 LATE_WAIT=3 WIDE_BACK=1` (unverified).
 Next (Z11): build ccbba7ff (fork-fast + VItoriaBr 5a84eb41). Z10 preset but `RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD_BUFFERS_MIN_MB=1` instead of `RELAY=2`. Then add `INDIRECT_GATHER`, `JOIN_PARTS`, `BACK_OWN_VIEW` back one per run.
+| Z11 | fork-fast ccbba7ff | Z10 preset but `RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD_BUFFERS_MIN_MB=1` | 3.4-3.9 | 146-156 / 48-61 | bright; waitress speckle in cutscene |
+
+Next (Z12): Z11 + `INDIRECT_GATHER=1`; then + `JOIN_PARTS=1`; then + `BACK_OWN_VIEW=1`.
