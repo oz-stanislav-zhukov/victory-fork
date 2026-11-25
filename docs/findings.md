@@ -72,3 +72,10 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | 2026-11-25 | target-main/release/victory-runY2/Z/Z2/Z3.exe | branches pushed, can be rebuilt; kept Z4 (last base without #993/#994) and Z5 |
 | 2026-11-25 | F:\Work\victory-fork\target-jman (807 MB) | JMAN tree not used (only a warning about da125a4) |
 | 2026-11-25 | 34 run logs (run..runZ3) -> archive\runs-A-to-Z3.zip (171 MB -> 36 MB folder) | conclusions are in this file and agent-log; raw kept zipped |
+
+## Posted to the community
+| Date | Where | What |
+|---|---|---|
+| 2026-11-25 | fxceless #148, #891, #917, #950 (x2) | Windows 10 results, #854 builds all pipelines, ambient + shade on NVIDIA, #854 for Arc hangs |
+| 2026-11-25 | [fxceless #652](https://github.com/fxceless/victory-fork/issues/652#issuecomment-7169362050) | `TEXTURE_GUARD=0` costs 40-60 ms here, does not clear skin noise, blackens the hall |
+| 2026-11-25 | [fxceless #994](https://github.com/fxceless/victory-fork/pull/994#issuecomment-7169362576) | builder runs 11 min on Win10/5060 Ti without CBV cap, but darker and GPU 172->272 ms |
