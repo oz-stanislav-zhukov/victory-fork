@@ -55,3 +55,7 @@ SHADER_OPT=0 BVH_BUILDER=1 BVH_QUARANTINE=1 RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD
 - Fixes: Instruction::new (270302d vs branch folding), quota parse type, test call sites.
 - lib tests green: shader, formats, hle, pe, loader, pipeline, gpu. ❓ not run in game yet.
 - Next candidates (conflict / open PRs): #583 wave64 own-bits (compare with our own_bits.rs), #574 ReBAR upload heaps (copy perf), streamed mips #576, epoch retirement, adapter by SM6.6, issue #331 = Win10 19045 + RTX 5060 report.
+- runO (jman-picks, cold pipeline cache: translator changed -> ~1900 pipelines rebuilt, ~55/min at 1-2 fps): ❌ world blurred, bloom blobs, ghosting. Cause: da125a4 (sampler: mip filter none forced MinLOD=MaxLOD=0; old code used min_lod -> title picks a mip of its blur/bloom chain that way). Reverted da125a4.
+- runP (jman-picks - da125a4, cache warm from runO): ✅ picture like runN (prison yard, hair, faces OK), no crash. 2.9-3.4 fps, 295-372 ms/frame (prep 106-178, GPU 161-184, copy-back 207-251). 11 untranslated shaders (runN 14). Ceiling panels still float (stale alias copies, unchanged). No fps gain vs runN.
+- Rule: a branch that touches shader translation invalidates the pipeline cache; judge pictures only after "(0 being made)".
+- Next: diff JMAN PR #583 vs our own_bits.rs (3 BVH programs: divergent readfirstlane); try PR #574 ReBAR upload heaps (copy-back ~220 ms); ceiling = #115 + 0bcc069 + SantannaCarlos hold-open fix when posted.
