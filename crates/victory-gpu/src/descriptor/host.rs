@@ -50,8 +50,7 @@ pub(crate) struct HostHeap {
     /// slots were free, but in pieces, and every such table walked the
     /// whole ring before it was refused: 0.33 ms each with 131,072 slots,
     /// 1.0 s of the recording threads in a frame that refused 3,143 (run
-    /// 45), under the lock all of them need. (A free run that lies across
-    /// the place the search starts from is seen by neither.)
+    /// 45), under the lock all of them need.
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
@@ -1067,6 +1066,26 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// The first fit in cursor order. Only starting positions wrap: a table
+/// can cross the search cursor but never the physical end of the heap.
+fn free_table(taken: &[bool], next: usize, n: usize) -> Option<usize> {
+    debug_assert!(n != 0 && n <= taken.len());
+    let end = taken.len() - n + 1;
+    let split = next.min(end);
+    for starts in [split..end, 0..split] {
+        let mut first = starts.start;
+        while first < starts.end {
+            // The last occupied slot also rules out every start from
+            // `first` through that slot.
+            match taken[first..first + n].iter().rposition(|&used| used) {
+                Some(blocked) => first += blocked + 1,
+                None => return Some(first),
+            }
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1083,23 +1102,7 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { free_table(taken, *next as usize, n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1118,7 +1121,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % taken.len()) as u32;
         Some(self.count + first as u32)
     }
 
@@ -3644,6 +3647,39 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_table_search_matches_every_small_heap() {
+        for len in 1..=9 {
+            for mask in 0..1_u32 << len {
+                let taken: Vec<bool> = (0..len).map(|i| mask & (1 << i) != 0).collect();
+                for next in 0..len {
+                    for n in 1..=len {
+                        let expected = (next..len).chain(0..next).find(|&first| {
+                            first + n <= len && !taken[first..first + n].contains(&true)
+                        });
+                        assert_eq!(free_table(&taken, next, n), expected, "{mask:b} {next} {n}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_free_table_can_straddle_the_dynamic_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let prefix = heap.dynamic(heap.dynamic - 80).unwrap();
+        let tail = heap.dynamic(32).unwrap();
+        heap.release(tail, 32);
+        // The final 80 slots are contiguous. The search cursor splits
+        // them into 32 previously released slots and 48 never used.
+        assert_eq!(heap.dynamic(64), Some(tail));
+        assert_eq!(heap.dynamic(16), Some(tail + 64));
+        assert_eq!(heap.dynamic(1), None);
+        assert_eq!(prefix, heap.count());
     }
 }
 
