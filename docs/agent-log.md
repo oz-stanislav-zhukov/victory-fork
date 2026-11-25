@@ -81,3 +81,7 @@ SHADER_OPT=0 BVH_BUILDER=1 BVH_QUARANTINE=1 RELAY=1 LATE_WAIT=3 WIDE_BACK=1 CARD
 - Run logs now kept in F:\Work\victory-runlogs (scratchpad copies too).
 - runZ3 corridor: guard's forearms show rainbow/purple speckle = same as waitress face -> one skin shader (SSS?) broken; Lucia's face fine there. Open.
 - fork-pool = fork-shade + fxceless PR #959 (Sashwiin, 23 commits: upstream XMA/audio fixes for the pool crash at 7-11 min, watchdog skip, GPU by name, pipeline library safety, bounded GPU waits, upload buffer reuse, page-pool in place off). One conflict in dstorage.rs (our &pages re-read + their timers) resolved.
+- runZ4 (fork-pool = fork-shade + #959): ~10+ min in world, no crash (user: earlier builds also did not crash here; #959 not proven). 3.7-4.1 fps, 244-273 ms/frame.
+- Live ambient tuning: "0.5 1 0.98 0.94 2.2 1.2 0.1 0.45" (strong AO) looked good in the cell, but suspected for black corridor walls -> reverted to default; walls stayed black => NOT the AO.
+- Corridor walls black with white "peeled paint" patches (runZ2 same corridor was fine), skin noise on waitress/cellmate/guard arms: likely stale textures the texture guard misses (242-276 "a texture picked by index changed after its upload with nothing to tell of it" per run in Z2/Z3/Z4). fxceless#652 (same RTX 5060 Ti): VICTORY_TEXTURE_GUARD=0 removed skin noise + ghosting, not slower.
+- NEXT: rerun fork-pool with VICTORY_TEXTURE_GUARD=0 (corridor walls, faces, guard arms). Then: Belobug ASYNC_SUBMIT, BVH builder with #646 + #935.
