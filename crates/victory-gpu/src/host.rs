@@ -6536,6 +6536,8 @@ mod spare {
 
     #[test]
     fn only_textures_made_for_rendering_take_render_target_views() {
+        use super::{host, null_target, renders_to};
+        use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
         let Some(host) = host() else { return };
         let make = |flags: D3D12_RESOURCE_FLAGS| {
             let desc = D3D12_RESOURCE_DESC {
