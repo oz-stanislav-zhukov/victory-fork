@@ -14,6 +14,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
+| Z8 | fork-skin (fork-rays + #934 + #927) | shaders changed (warm-up) | 3-4 | 244-385 | guard's forearms CLEAN at B35 (fully rainbow in Z7): #934/#927 fix the skin noise. Waitress face rainbow only in the opening cutscene (cold cache?). Lucia's eyes STILL glow (#934 not the eye fix). New: grey blotches on cell walls/ceiling and one corridor wall, stay with AO back at default -> from #927 or #934 (fork-934 built to split) | best for skin |
 | Z7 | fork-rays (+ambient counters) | builder OFF, guard ON | 3.3-3.7 cell | 267-306 | user: best so far. Waitress face CLEAN (speckled in Z6, clean in Z3: intermittent). Lucia's/waitress eyes still glow. Faces and some objects flicker black now and then. Corners lack occlusion -> live AO raised (ambient.txt 0.5 1 0.98 0.94 2.2 1.2 0.1 0.45, default kept in ambient-default.txt) | guard back on = textures 4-32 ms again |
 | Z6 | fork-rays (+#148) | builder OFF, `TEXTURE_GUARD=0` | 3-4 (median 3.4); hall 2 | 243-385; hall 443 (9.6k draws) | bright again; corridor walls normal (were black in Z4); waitress face STILL rainbow; Lucia eyes glow; orange 8x8 blocks on Lucia's hair in common room | fork-rays = new base. Guard is not the skin noise |
 | Z5 | fork-rays | #993+#994, builder ON | 2.4-3.0 | 335-460 | much darker, GPU ~270 ms, copy-back ~280 ms | builder runs without crash, but rays not worth it yet |
@@ -71,6 +72,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | 2026-11-25 | git stash (2 entries) | both only a build-regenerated Cargo.lock |
 | 2026-11-25 | target-main/release/victory-runY2/Z/Z2/Z3.exe | branches pushed, can be rebuilt; kept Z4 (last base without #993/#994) and Z5 |
 | 2026-11-25 | F:\Work\victory-fork\target-jman (807 MB) | JMAN tree not used (only a warning about da125a4) |
+| 2026-11-25 | git stash on fork-skin (auto, branch switch) | only the build-regenerated Cargo.lock |
 | 2026-11-25 | 34 run logs (run..runZ3) -> archive\runs-A-to-Z3.zip (171 MB -> 36 MB folder) | conclusions are in this file and agent-log; raw kept zipped |
 
 ## Posted to the community
