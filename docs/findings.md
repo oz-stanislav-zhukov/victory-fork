@@ -14,6 +14,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
+| Z9 | fork-fast (fork-934 + #1002 + fxceless main d510ee4a) | + ASYNC_SUBMIT QUEUE2 TEXTURE_NO_WAIT MERGE_GAP=64 MERGE_RUNS=4096 INDIRECT_GATHER JOIN_PARTS BACK_OWN_VIEW | **4.7-5.1** (window 4.1) | 195-212 (GPU 109-118, copy-back 41-51!) | FASTEST so far, but cell dark again (ambient logged on) and a cutscene shows a huge white bloom + rainbow streak. Suspect: exposure the title reads back arrives late/stale with the new back-copy switches (BACK_OWN_VIEW first) | bisect switches |
+| Z8 | fork-skin (fork-rays + #934 + #927) | shaders changed (warm-up) | 3-4 | 244-385 | guard's forearms CLEAN at B35 (fully rainbow in Z7): #934/#927 fix the skin noise. Waitress face rainbow only in the opening cutscene (cold cache?). Lucia's eyes STILL glow (#934 not the eye fix). New: grey blotches on cell walls/ceiling and one corridor wall, stay with AO back at default -> from #927 or #934 (fork-934 built to split) | best for skin |
 | Z7 | fork-rays (+ambient counters) | builder OFF, guard ON | 3.3-3.7 cell | 267-306 | user: best so far. Waitress face CLEAN (speckled in Z6, clean in Z3: intermittent). Lucia's/waitress eyes still glow. Faces and some objects flicker black now and then. Corners lack occlusion -> live AO raised (ambient.txt 0.5 1 0.98 0.94 2.2 1.2 0.1 0.45, default kept in ambient-default.txt) | guard back on = textures 4-32 ms again |
 | Z6 | fork-rays (+#148) | builder OFF, `TEXTURE_GUARD=0` | 3-4 (median 3.4); hall 2 | 243-385; hall 443 (9.6k draws) | bright again; corridor walls normal (were black in Z4); waitress face STILL rainbow; Lucia eyes glow; orange 8x8 blocks on Lucia's hair in common room | fork-rays = new base. Guard is not the skin noise |
 | Z5 | fork-rays | #993+#994, builder ON | 2.4-3.0 | 335-460 | much darker, GPU ~270 ms, copy-back ~280 ms | builder runs without crash, but rays not worth it yet |
@@ -33,6 +35,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | Black walls are time-dependent (degrade later in a run) | Z6, user | REFUTED: in Z6 the cell-block corridor stays fine all run (was black in Z4); the big common hall (A102/A103, first mission) is black with white patches. Area/material dependent. Corridor fix in Z6 = guard off, #148 or #994 (not yet split) |
 | Darkness with builder on = ambient switched off | Z5 log `ambient ... shaded=true` | REFUTED: ambient on; ray passes occlude it |
 | Builder crash at world entry (0xffff... read) | Z5 with #994 | FIXED by #994 (thread-count dispatches) |
+| Which change fixed the black walls | Z4 (guard on, no #148/#994): corridor black. Z6 (guard OFF, +#148/#994): corridor fine, hall black. Z7 (guard on, +#148/#994): corridor AND hall fine | SETTLED: #148 or #994 fixed the corridor; guard OFF caused the black hall in Z6. Keep guard on. Hall with 10-11k draws: 3 fps / 316-342 ms in Z7 vs 2 fps / 443 ms in Z6 |
 | #2473 (Marvisak) affects us | code read | NO: needs `VICTORY_REFRESH_ONCE=1`, off here |
 | #2414 (Marvisak) affects us | code read | NO: our fxceless watch.rs has no alias-following `changed` |
 | JMAN da125a4 (sampler mip-none) | runs | HARMFUL: whole image blurry; reverted |
@@ -59,9 +62,10 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Open problems
 1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard, intermittent (Z3 clean, Z6 speckled, Z7 clean). Qwen report 01: v_interp_p2_f16 always writes the low half (lower.rs low_half), fixed by fxceless #934; #927 notes an intermediate form gave 'rainbow squares on the waitress' skin'. Both merged on branch fork-skin, to run next.
 1b. Faces and some objects flicker black for a frame (Z7). Ambient counters (seen / replaced / indirect) in the log will tell if the resolve sometimes runs unreplaced.
-2. Lucia's eyes glow white/blue in close-ups.
+2. Lucia's eyes glow white/blue in close-ups. Qwen report 02: same #934 (v_interp_p2_f16 drops clamp/omod: values >1 blow out white); #948/#1019/#927 unlikely. Test on fork-skin.
+2b. Z7: guard's forearms fully rainbow at door B35 (face clean): skin noise is per shader variant, not per run.
 3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
-4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
+4. Orange 8x8 blocks on Lucia's hair (common room, Z6); Z7: blocky squares over the hall ceiling, lamps and windows in one shot (light/volumetric pass tiles?).
 5. Rays: builder runs but darkens the image and doubles GPU time. Qwen 04: tree is partly garbage (our translator drops s_waitcnt: Belobug 72e748ea adds UAV fences around atomics; empty +-inf boxes occlude everything, fxceless #16); quarantine leaks (#1013). Even fixed, ~88 ms more GPU a frame: parked while fps is the priority.
 5b. Hair blocks: Qwen 03 -> fxceless #1002 (CS_ShadowRenderTiled* on 32-lane hosts, matches fxceless #62 word for word). Merged on fork-934/fork-fast.
 6. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
@@ -72,7 +76,15 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | 2026-11-25 | git stash (2 entries) | both only a build-regenerated Cargo.lock |
 | 2026-11-25 | target-main/release/victory-runY2/Z/Z2/Z3.exe | branches pushed, can be rebuilt; kept Z4 (last base without #993/#994) and Z5 |
 | 2026-11-25 | F:\Work\victory-fork\target-jman (807 MB) | JMAN tree not used (only a warning about da125a4) |
+| 2026-11-25 | git stash on fork-skin (auto, branch switch) | only the build-regenerated Cargo.lock |
 | 2026-11-25 | 34 run logs (run..runZ3) -> archive\runs-A-to-Z3.zip (171 MB -> 36 MB folder) | conclusions are in this file and agent-log; raw kept zipped |
+
+## Posted to the community
+| Date | Where | What |
+|---|---|---|
+| 2026-11-25 | fxceless #148, #891, #917, #950 (x2) | Windows 10 results, #854 builds all pipelines, ambient + shade on NVIDIA, #854 for Arc hangs |
+| 2026-11-25 | [fxceless #652](https://github.com/fxceless/victory-fork/issues/652#issuecomment-7169362050) | `TEXTURE_GUARD=0` costs 40-60 ms here, does not clear skin noise, blackens the hall |
+| 2026-11-25 | [fxceless #994](https://github.com/fxceless/victory-fork/pull/994#issuecomment-7169362576) | builder runs 11 min on Win10/5060 Ti without CBV cap, but darker and GPU 172->272 ms |
 
 ## TODO
 - In-game stats panel like "Kitty Runtime" (user screenshot, 2026-11-25): title + big fps, then a row FRAME / GPU WAIT / CPU PREP / COPY-BACK in ms, then draws/frame, dropped/frame, RAM. Base: `crates/victory-gpu/src/fpsbox.rs` (fxceless ca8829ff, fps drawn into the top-left corner, `VICTORY_FPS_COUNTER=0` off). The numbers already exist in the frame line (host.rs "fps, ms/frame (preparing ...; on the GPU; copying back ...)"). Make it a small dark panel with labels; switch to toggle.
