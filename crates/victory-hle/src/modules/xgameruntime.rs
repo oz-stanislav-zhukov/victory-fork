@@ -384,7 +384,7 @@ mod tests {
             xasync::E_NOT_SUFFICIENT_BUFFER
         );
         assert_eq!(buffer, [0xaa; 4], "nothing is written on failure");
-        assert_eq!(used, 0xdead_beef, "and no size is reported");
+        assert_eq!(used, 4, "and the size it needs is reported");
     }
 
     #[test]
