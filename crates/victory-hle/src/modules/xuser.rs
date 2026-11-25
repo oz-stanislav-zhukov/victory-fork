@@ -231,12 +231,7 @@ extern "system" fn token_async(
         url = text(url).unwrap_or_default(),
         "token and signature: offline"
     );
-    // Report success with the empty (but non-null) TOKEN result buffer rather than
-    // FAILED_TO_GET_TOKEN. The title's auth path only initialises the object it later
-    // dereferences when this call completes successfully; with the failure it took a null
-    // read at title+0xb5a5f8 right after XUserAddAsync (issue #348). Nothing is contacted:
-    // the URL is never opened, the buffer stays empty, and the offline user is unchanged.
-    xasync::finished(block, (&raw const TOKEN).cast(), S_OK)
+    xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
 extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
     xasync::XAsyncGetResultSize(block, out)
@@ -272,16 +267,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
     USER_NOT_FOUND
 }
 
-/// 1: one offline local user can be signed in at a time.
-///
-/// This slot was a `missing` stub (E_NOTIMPL, no output written). The title calls it during
-/// its account init right after XUserAddAsync and dereferences the output regardless, which
-/// is the null read at title+0xb5a5f8 (issue #348, second suggestion).
-extern "system" fn get_max_users(_: This, _: Handle, out: *mut u32) -> HRESULT {
-    put(out, 1)
-}
-
-// Unset slots (no title seen calls them): gamer pictures,
+// Unset slots (no title seen calls them): maximum users, gamer pictures,
 // the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
     missing::<0> as *const (),             // 0x00 QueryInterface
@@ -290,7 +276,7 @@ static VTABLE: Methods<35> = Methods([
     duplicate as *const (),                // 0x18
     close as *const (),                    // 0x20
     compare as *const (),                  // 0x28
-    get_max_users as *const (),            // 0x30 maximum users
+    missing::<6> as *const (),             // 0x30 maximum users
     add_async as *const (),                // 0x38
     add_result as *const (),               // 0x40
     get_local_id as *const (),             // 0x48

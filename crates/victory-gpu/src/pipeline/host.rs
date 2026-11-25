@@ -722,26 +722,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    ?shaders,
-                    vs_bytes = code_bytes(&code(0)).len(),
-                    ps_bytes = code_bytes(&code(1)).len(),
-                    num_rt = g.targets.NumRenderTargets,
-                    rtv0 = g.targets.RTFormats[0].0 as i32,
-                    dsv = g.depth_format.0 as i32,
-                    samples = g.samples.Count,
-                    inputs = g.inputs.len(),
-                    cull = g.rasterizer.CullMode.0,
-                    fill = g.rasterizer.FillMode.0,
-                    depth_enable = g.depth.DepthEnable.0,
-                    blend_enable = g.blend.RenderTarget[0].BlendEnable.0,
-                    blend_op = g.blend.RenderTarget[0].BlendOp.0,
-                    src_blend = g.blend.RenderTarget[0].SrcBlend.0,
-                    dst_blend = g.blend.RenderTarget[0].DestBlend.0,
-                    topo = g.topology.0 as i32,
-                    "host pipeline refused"
-                );
+                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
@@ -885,9 +866,7 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let heap_indexing = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
-    let desc_with = |flags| D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
             Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
@@ -895,51 +874,26 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: flags,
+                Flags: input
+                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
             },
         },
     };
-    let desc = desc_with(input | heap_indexing);
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(ref error) = error {
+            if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
                     error.GetBufferSize(),
                 );
                 tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
             }
-            // Windows 10's d3d12core rejects the two root-signature-1.1 heap-indexing flags
-            // outright ("Unsupported bit-flag set"), and a refused signature drops every draw
-            // that uses it (drawn=0 with a black frame). Both flags only promise that shaders
-            // may index the descriptor heaps directly; the pipeline still binds the same heaps
-            // through root parameters. Retry without them so the menu draws on this host.
-            drop(error.take());
-            blob = None;
-            let retry = desc_with(input);
-            let mut retry_error: Option<ID3DBlob> = None;
-            match D3D12SerializeVersionedRootSignature(&retry, &mut blob, Some(&mut retry_error)) {
-                Ok(()) => {
-                    tracing::warn!(
-                        "root signature: retried without the 1.1 heap-indexing flags and it serialized"
-                    );
-                }
-                Err(e2) => {
-                    if let Some(error) = retry_error {
-                        let text = std::slice::from_raw_parts(
-                            error.GetBufferPointer().cast::<u8>(),
-                            error.GetBufferSize(),
-                        );
-                        tracing::warn!("root signature (retry): {}", String::from_utf8_lossy(text));
-                    }
-                    return Err(e2);
-                }
-            }
-            let _ = e;
+            return Err(e);
         }
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
