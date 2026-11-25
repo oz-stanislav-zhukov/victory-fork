@@ -138,6 +138,11 @@ Memory sync between the title's memory and the copies on the card:
   them in every run) and can open the guards there:
   `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
+- A page-destination read whose page numbers the title writes after it
+  enqueued the request reads them again for up to 250 ms instead of failing
+  at once: up to 302 requests of a burst at the opening's loading failed so
+  (their models or textures kept whatever their pages held); none since
+  (RTX 5090).
 
 Card memory (the test card is full from the first frame of the world: 85 to
 99 % of its budget for a whole run, about 26,000 texture copies let go and
