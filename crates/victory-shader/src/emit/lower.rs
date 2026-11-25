@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, DRIVER, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -30,10 +30,32 @@ pub(super) mod intersect;
 #[path = "descriptor_data.rs"]
 mod descriptor_data;
 
+/// The iteration limit of translated loops and the loop notes, a child module so it shares the
+/// emitter's state.
+#[path = "loops.rs"]
+mod loops;
+#[cfg(test)]
+pub(super) use loops::TEST_NOTES;
+pub(super) use loops::{COMPUTE_LOOP_LIMIT, PIXEL_LOOP_LIMIT, TRACE_LOOP_LIMIT, VERTEX_LOOP_LIMIT};
+use loops::notes_on;
+/// Blocks every lane runs (the regions of lane branches), a child module.
+#[path = "regions.rs"]
+mod regions;
+use regions::{all_lane_blocks, lane_regions};
+
 /// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
 /// module so it shares the emitter's state.
 #[path = "float64.rs"]
 mod float64;
+
+/// The paired form's guarded writes read without their guard where only lanes inside it read
+/// them, a child module so it shares the emitter's state.
+#[path = "guarded.rs"]
+mod guarded;
+/// A geometry program's LDS rings as its inputs and outputs, a child module so it shares the
+/// emitter's state.
+#[path = "rings.rs"]
+mod rings;
 
 type Why = &'static str;
 
@@ -69,6 +91,9 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// How a console wave64 compute program was run on a host of 32-lane waves
+    /// ([`super::forms`]), empty otherwise.
+    pub form: &'static str,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -275,6 +300,10 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange`, in a program for dispatches by thread counts ([`with_thread_limits`]):
+    /// whether the other host wave of this thread's console wave has a launched thread (made
+    /// in the entry block). One that has none has left, and its exchange dword holds 0.
+    partner_live: Option<V>,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -303,14 +332,28 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
+    /// Loop headers' iteration counters (see [`PIXEL_LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loops whose code fixes how often they go round again
+    /// (`trip::constant_passes`), by header IR block.
+    passes: HashMap<usize, u32>,
+    /// Counted loops that go round by jumps back alone, innermost first: the
+    /// header and the blocks of the loop ([`Self::jump_loop_exit`]).
+    jump_loops: Vec<(usize, Vec<bool>)>,
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
+    /// The block a loop stopped by its limit leaves the program from.
     abort: Option<usize>,
+    /// With loop notes ([`super::loop_notes`]): each counted loop's number in
+    /// its program's notes (`shader::SLOT_LOOPS`), by header IR block.
+    notes: Option<HashMap<usize, u32>>,
+    /// A pixel program that reads first lanes (`v_readfirstlane_b32`): what
+    /// scalar code makes of such a read may differ in helper lanes
+    /// ([`Self::helper_own`]), so every heap index is taken as one that may
+    /// differ between lanes.
+    helper_scalars: bool,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -322,10 +365,18 @@ struct Lower<'a> {
     /// The paired form: scalars each lane has its own of (a waterfall loop's first-lane reads
     /// and what is computed from them), on which no branch takes both lanes of a thread.
     lane_scalars: HashSet<Value>,
+    /// The paired form: what guarded writes computed before their guard, for readers under a
+    /// guard that implies it ([`guarded`]); the guard of the instruction being lowered when
+    /// its sources may be read so; the searches of those implications.
+    raw: guarded::Raws,
+    raw_use: Option<(Bool, V)>,
+    raw_meets: crate::structure::Meets,
     /// Linked for one pipeline ([`super::link`]): per input and output element, whether it
     /// is left out (empty when not linking).
     drop_in: Vec<bool>,
     drop_out: Vec<bool>,
+    /// A geometry program's vertices so far ([`rings`]).
+    emitted: rings::Emitted,
 }
 
 /// What the lowering keeps per console lane, for the paired form ([`with_paired_lanes`]): each
@@ -346,28 +397,8 @@ struct LaneState {
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     strides: HashMap<(usize, Site, u8), V>,
     clane: Option<V>,
+    raw: guarded::Raws,
 }
-
-/// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
-/// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
-pub(super) const LOOP_LIMIT: u32 = 1 << 20;
-
-/// Iterations after which a loop of a program that tests rays against tree
-/// nodes is left, unless [`super::loop_limit`] names a limit for all.
-///
-/// A ray's walk of a well-formed tree visits some hundreds of nodes at
-/// most. The title's shadow-mask rays ran to the compute limit of 4,096: the
-/// trees of moving objects are built by the title's builder, which is off,
-/// so a walk into one follows whatever its memory holds. At 4,096 the
-/// shadow mask took 11.7 ms of the card a frame, at 1,024 2.4 ms (timing
-/// runs of the opening of the gameplay, RTX 5090); a ray stopped either way
-/// leaves the program as killed, as before.
-pub(super) const TRACE_LOOP_LIMIT: u32 = 1 << 10;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -401,82 +432,6 @@ pub(super) const CHOSEN: Why = "a descriptor chosen by control flow";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
-/// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
-/// the branch that do not post-dominate it). None with an indirect exit (not followed).
-fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
-    let n = st.exits.len();
-    let mut all = vec![true; n];
-    for (_, region) in lane_regions(st)? {
-        for b in (0..n).filter(|&b| region[b]) {
-            all[b] = false;
-        }
-    }
-    Some(all)
-}
-
-/// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
-/// not post-dominate it, which only some lanes run. Not the branches the wave takes together
-/// ([`Structured::wide`]), nor those on scalar conditions. None with an indirect exit.
-fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
-    let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, e) in st.exits.iter().enumerate() {
-        match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
-            LaneExit::Branch { taken, not_taken, .. } => {
-                succ[b].push(taken);
-                succ[b].push(not_taken);
-            }
-            LaneExit::End => {}
-            LaneExit::Indirect => return None,
-        }
-    }
-    // post-dominators (bitsets; a virtual exit after every End)
-    let words = n.div_ceil(64);
-    let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n).map(|b| if succ[b].is_empty() { let mut v = vec![0; words]; v[b / 64] |= 1 << (b % 64); v } else { full.clone() }).collect();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in (0..n).rev() {
-            if succ[b].is_empty() {
-                continue;
-            }
-            let mut v = full.clone();
-            for &t in &succ[b] {
-                for w in 0..words {
-                    v[w] &= pdom[t][w];
-                }
-            }
-            v[b / 64] |= 1 << (b % 64);
-            if v != pdom[b] {
-                pdom[b] = v;
-                changed = true;
-            }
-        }
-    }
-    let mut regions = Vec::new();
-    for (d, e) in st.exits.iter().enumerate() {
-        let LaneExit::Branch { when, .. } = *e else { continue };
-        if st.wide.contains(&d) || st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))) {
-            continue; // a wave-wide or uniform branch: all lanes go the same way
-        }
-        // blocks reachable from the lane branch that do not post-dominate it
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = succ[d].clone();
-        while let Some(b) = stack.pop() {
-            if seen[b] || pdom[d][b / 64] >> (b % 64) & 1 == 1 {
-                continue;
-            }
-            seen[b] = true;
-            stack.extend(succ[b].iter().copied());
-        }
-        regions.push((d, seen));
-    }
-    Some(regions)
-}
-
 /// The per-lane branches (by block) whose regions hold a block of `needs` (blocks where two
 /// host waves must meet, [`take_needs`]): the ones to take wave-wide
 /// ([`crate::structure::structure_wide`]) so that every lane runs those blocks. None if one
@@ -735,7 +690,28 @@ thread_local! {
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_paired_lanes`].
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_thread_limits`].
+    static THREAD_LIMITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Runs `f` with compute programs lowered for dispatches by thread counts
+/// (`super::translate_thread_limited`): the threads past the counts the host gives
+/// (`USER_THREAD_LIMIT`) leave before the program ([`Lower::thread_limit_prologue`]).
+pub(super) fn with_thread_limits<R>(f: impl FnOnce() -> R) -> R {
+    let was = THREAD_LIMITS.replace(true);
+    let r = f();
+    THREAD_LIMITS.set(was);
+    r
+}
+
+/// Whether compute programs are lowered for dispatches by thread counts ([`with_thread_limits`]).
+pub(super) fn thread_limits() -> bool {
+    THREAD_LIMITS.get()
+}
+
+/// A program for dispatches by thread counts in a form where threads cannot leave alone (two
+/// console lanes a thread) or that does not give what the console computes anyway.
+pub(super) const LIMITS_INEXACT: Why = "a thread group cut short, in the paired or an approximate form";
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
 /// each console wave is one host wave of 32 lanes, and host lane n runs console lanes n and
@@ -1071,6 +1047,9 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        s.geometry = x.io.geometry.as_ref().map(|g| super::shader::Geometry {
+            max_vertices: g.max_vertices,
+        });
         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
@@ -1395,6 +1374,7 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            partner_live: None,
             halves,
             wave_base: None,
             flat: None,
@@ -1427,14 +1407,26 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            passes: HashMap::new(),
+            jump_loops: Vec::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            notes: None,
+            helper_scalars: super::helper_own()
+                && x.native.stage == HwStage::Ps
+                && p.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| i.name() == "v_readfirstlane_b32")),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+            raw: HashMap::new(),
+            raw_use: None,
+            raw_meets: Default::default(),
             drop_in,
             drop_out,
+            emitted: Default::default(),
         }
     }
 
@@ -1461,6 +1453,7 @@ impl<'a> Lower<'a> {
         std::mem::swap(&mut self.handles, &mut t.handles);
         std::mem::swap(&mut self.strides, &mut t.strides);
         std::mem::swap(&mut self.clane, &mut t.clane);
+        std::mem::swap(&mut self.raw, &mut t.raw);
         self.upper = !self.upper;
     }
 
@@ -1835,7 +1828,13 @@ impl<'a> Lower<'a> {
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
                     let (lo, hi) = (back(self, lo), back(self, hi));
-                    self.join_halves(op, lo, hi, float)
+                    let joined = self.join_halves(op, lo, hi, float);
+                    // (a half none of whose threads was launched has left, its dword holding
+                    // 0, which is no identity of AND, MIN or MAX: this half's result alone)
+                    match self.partner_live {
+                        Some(partner) => self.s.m.select(self.cur, partner, joined, r),
+                        None => joined,
+                    }
                 }
             }
         } else {
@@ -2032,7 +2031,12 @@ impl<'a> Lower<'a> {
         } else {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
-        if !every {
+        // (in a dispatch by thread counts some lanes may never have been launched: the tree
+        // would read lanes that left)
+        if thread_limits() && halves {
+            return Err(LIMITS_INEXACT);
+        }
+        if !every || thread_limits() {
             if halves {
                 need(self.cur_ir);
                 return Err(WHERE);
@@ -2148,7 +2152,16 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // For dispatches by thread counts (`with_thread_limits`): the entry block lets only the
+        // launched threads into the program, which starts in a block of its own.
+        let limited = (thread_limits() && matches!(self.x.native.io, StageIo::Cs(_))).then(|| {
+            let body = self.s.m.new_block();
+            if let Some(&first) = order.first() {
+                self.block[first] = Some(body);
+            }
+            body
+        });
+        // Loop headers count iterations (`PIXEL_LOOP_LIMIT`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -2158,7 +2171,19 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                if let Some(n) = super::trip::constant_passes(p, &self.rpo, b) {
+                    self.passes.insert(b, n);
+                }
             }
+        }
+        self.find_jump_loops();
+        if notes_on() {
+            // Numbered by their first code byte, which the host logs too.
+            let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+            headers.sort_by_key(|&h| (p.blocks[h].offset, h));
+            let last = super::shader::LOOP_NOTES / super::shader::LOOP_NOTE_DWORDS - 1;
+            let numbered = headers.into_iter().enumerate().map(|(n, h)| (h, (n as u32).min(last)));
+            self.notes = Some(numbered.collect());
         }
         self.cur = self.s.entry;
         // Title memory written by address has no rasterizer-ordered form.
@@ -2187,6 +2212,9 @@ impl<'a> Lower<'a> {
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
+        }
+        if let Some(body) = limited {
+            self.thread_limit_prologue(body).map_err(|w| unsupported(0, w))?;
         }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
@@ -2272,8 +2300,18 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let form = match () {
+            _ if self.twin.is_some() => super::forms::PAIRED,
+            _ if self.local && self.local_any => super::forms::LOCAL_ANY,
+            _ if self.local => super::forms::LOCAL,
+            _ if self.exchange.is_some() => super::forms::EXCHANGE,
+            _ if self.halves.is_some() => super::forms::HALVES,
+            _ if self.x.native.wave64 && wave_size == Some(64) => super::forms::WAVE64,
+            _ => "",
+        };
         Ok(Lowered {
             wave_size,
+            form,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2372,21 +2410,16 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let (entry, i32t) = (self.s.entry, self.s.t.i32);
+                return Val::I32(self.s.op(entry, "primitiveID.i32", Attr::ReadNone, i32t, 108, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            // The host's group id plus the dispatch's first group in x
-            // (`shader.rs` `USER_GROUP_BASE`).
-            Input::GroupId(0) => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
-                    unreachable!()
-                };
-                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
-                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base));
-            }
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.group_id(c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2449,6 +2482,20 @@ impl<'a> Lower<'a> {
             }
         };
         self.load_input(id, col)
+    }
+
+    /// Component `c` of the console's group id: in x, counted from the group the host starts
+    /// this dispatch at (`shader.rs` `USER_GROUP_BASE`): the host runs a dispatch of more
+    /// groups than it allows as several.
+    fn group_id(&mut self, c: u8) -> Val {
+        let id = self.compute_id("groupId.i32", 94, c);
+        if c != 0 || self.user_first() != 0 {
+            return id;
+        }
+        let Val::I32(g) = id else { unreachable!() };
+        use super::shader::USER_GROUP_BASE;
+        let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
+        Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, base))
     }
 
     /// A component of a compute thread or group id, read in the entry block.
@@ -2772,6 +2819,11 @@ impl<'a> Lower<'a> {
         use super::shader::USER_VIEW_ADDRESS;
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
+        // Picked from the view heap at an index the code computes: from
+        // the host's table of view addresses by heap slot.
+        if rp.root == RootType::ResourceHeap {
+            return self.heap_view_address(site);
+        }
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
             return None;
         }
@@ -2793,6 +2845,27 @@ impl<'a> Lower<'a> {
         let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
         let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
         Some((lo, hi))
+    }
+
+    /// The title address (low dword, bits from 32 up) of the view at the
+    /// heap slot the descriptor load at `site` reads, from the host's table
+    /// ([`super::shader::SLOT_VIEW_ADDRESSES`]), in the current block.
+    fn heap_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        // Inside the table whatever the index (lanes that do not run
+        // compute one too).
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let k3 = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let h = self.s.root_srv_handle(super::shader::SLOT_VIEW_ADDRESSES);
+        let (iu, both, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, byte, iu, both, align]);
+        let (lo, hi) = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        Some((self.as_int(lo), self.as_int(hi)))
     }
 
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
@@ -2909,7 +2982,7 @@ impl<'a> Lower<'a> {
         };
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
@@ -3215,7 +3288,7 @@ impl<'a> Lower<'a> {
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -3300,10 +3373,13 @@ impl<'a> Lower<'a> {
                 let val = inst.read(r).ok_or("an unread operand")?;
                 match self.floats.get(&val) {
                     Some(&f) => f,
-                    None => {
-                        let x = self.i32_of(val)?;
-                        self.as_float(x)
-                    }
+                    None => match self.raw_float(val) {
+                        Some(f) => f,
+                        None => {
+                            let x = self.i32_of(val)?;
+                            self.as_float(x)
+                        }
+                    },
                 }
             }
             _ => {
@@ -4029,6 +4105,7 @@ impl<'a> Lower<'a> {
                 };
                 let v = self.s.m.select(self.cur, g, x, old);
                 self.s.m.tag(v, Tag::Guard);
+                self.note_raw(new, x, g);
                 v
             }
             _ => x,
@@ -4095,11 +4172,14 @@ impl<'a> Lower<'a> {
         };
         let x = self.as_int(f);
         self.write(inst, Reg::V(reg), x, guard);
-        if guard.is_none()
-            && Self::sdwa_dst(inst).is_none()
+        if Self::sdwa_dst(inst).is_none()
             && let Some(new) = inst.write(Reg::V(reg))
         {
-            self.floats.insert(new, f);
+            if guard.is_none() {
+                self.floats.insert(new, f);
+            } else {
+                self.note_raw_float(new, f);
+            }
         }
         Ok(())
     }
@@ -4228,6 +4308,80 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
+    }
+
+    /// A program for dispatches by thread counts ([`with_thread_limits`]): the entry block
+    /// works out whether this thread was launched – its console thread's id in the dispatch
+    /// (its group's first, plus its index in the group) below the host's counts
+    /// ([`super::shader::USER_THREAD_LIMIT`]) along every dimension – and the others leave
+    /// there. The program goes on in `body`, and what is made "in the entry block" from here on
+    /// goes there too, so that what it asks of the wave (a ballot of EXEC on entry, a sum over
+    /// the lanes) counts the launched threads only, as the console's partial wave does.
+    /// Two host waves that exchange (a console wave64 program on a host of 32-lane waves) first
+    /// tell each other whether they have a launched thread: one with none leaves whole, and its
+    /// exchange dword keeps that 0, which is what a half without a lane in EXEC gives every
+    /// exchange but a reduction's join ([`Self::partner_live`]).
+    // shortcut: a thread that leaves is taken to stop holding up the group's barriers, as an
+    // exited thread does on NVIDIA's and AMD's GPUs (D3D12 leaves a barrier that some thread
+    // of the group does not reach undefined).
+    fn thread_limit_prologue(&mut self, body: usize) -> Result<(), Why> {
+        use super::shader::USER_THREAD_LIMIT;
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return Err("thread counts outside compute");
+        };
+        // (one host thread with two console lanes cannot leave for one of them)
+        if self.twin.is_some() {
+            return Err(LIMITS_INEXACT);
+        }
+        let e = self.s.entry;
+        let mut live: Option<V> = None;
+        // (a dimension whose groups are one thread wide is never cut short: its count is its
+        // groups' and no word is asked for it, which keeps the user data of the structure
+        // builder's programs, whose root signatures are close to the host's 64 dwords, one
+        // dword longer at most)
+        for d in (0..3u8).filter(|&d| cs.threads[usize::from(d)] > 1) {
+            let limit = self.host_word(RootType::Other(USER_THREAD_LIMIT), 0, u32::from(d));
+            let Val::I32(group) = self.group_id(d) else {
+                return Err("a group id");
+            };
+            let Val::I32(thread) = self.thread_id(d) else {
+                return Err("a thread id");
+            };
+            let size = self.s.m.i32(cs.threads[usize::from(d)]);
+            let first = self.s.m.bin(e, Bin::Mul, group, size);
+            let id = self.s.m.bin(e, Bin::Add, first, thread);
+            let inside = self.s.m.cmp(e, pred::IULT, id, limit);
+            live = Some(match live {
+                Some(l) => self.s.m.bin(e, Bin::And, l, inside),
+                None => inside,
+            });
+        }
+        let Some(live) = live else {
+            // (groups of one thread: none is ever cut short)
+            self.s.m.terminate(e, Term::Br(body));
+            self.s.entry = body;
+            self.cur = body;
+            return Ok(());
+        };
+        if self.exchange.as_ref().is_some_and(|x| !x.1) && !self.local {
+            let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+            let some = self.s.op(e, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[live]);
+            self.s.flags |= flags::WAVE_OPS;
+            let some = self.s.m.cast(e, Cast::ZExt, some, i32t);
+            let (lo, hi) = self.exchange_halves(e, some);
+            let cl = self.console_lane();
+            let k32 = self.s.m.i32(32);
+            let upper = self.s.m.cmp(e, pred::IUGE, cl, k32);
+            let other = self.s.m.select(e, upper, lo, hi);
+            let z = self.s.m.i32(0);
+            self.partner_live = Some(self.s.m.cmp(e, pred::NE, other, z));
+        }
+        let gone = self.s.m.new_block();
+        self.s.m.terminate(e, Term::CondBr(live, body, gone));
+        self.s.m.terminate(gone, Term::Ret);
+        self.s.entry = body;
+        self.cur = body;
+        Ok(())
     }
 
     /// Mesh: the counts and the primitives no lane exports. The console's
@@ -4383,7 +4537,33 @@ impl<'a> Lower<'a> {
     /// `x` in the first lane of this host wave where `guard` holds, and whether it has such a
     /// lane: the console reads the first lane of EXEC, and a lane that got here with EXEC clear
     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+    /// A helper lane of a pixel shader takes its own `x` ([`Self::helper_own`]).
     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
+        let (first, any) = self.first_lane_of_wave(x, guard);
+        (self.helper_own(x, first), any)
+    }
+
+    /// `first`, a first-lane read of `x`, or in a helper lane of a pixel shader `x` itself.
+    /// The console runs a pixel program's helper lanes as lanes of EXEC (whole-quad mode,
+    /// `s_wqm`), so a waterfall loop serves a helper lane in a pass of its own, with its own
+    /// descriptor. The host's wave operations leave helper lanes out (SM 6.6) and give them
+    /// undefined results: on an RTX 5090 a helper lane whose value no other lane of its wave
+    /// held never met it as the first lane, went round to the iteration limit and left with
+    /// what the loop computes never set (`loop_tests`), and its quad's derivatives read that
+    /// (the character skin and cloth program `94d281151ca58b4f` samples its layers in nine
+    /// such nested loops).
+    fn helper_own(&mut self, x: V, first: V) -> V {
+        if !self.s.pixel || !super::helper_own() {
+            return first;
+        }
+        let c = self.cur;
+        let i1t = self.s.t.i1;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1t, 221, &[]);
+        self.s.m.select(c, helper, x, first)
+    }
+
+    /// [`Self::first_lane`] as the host's wave operations see the wave.
+    fn first_lane_of_wave(&mut self, x: V, guard: Option<V>) -> (V, V) {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
@@ -4468,7 +4648,7 @@ impl<'a> Lower<'a> {
         (0..n)
             .map(|k| {
                 let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.source(v)
             })
             .collect()
     }
@@ -4488,6 +4668,9 @@ impl<'a> Lower<'a> {
         };
         if *gds {
             return Err("GDS");
+        }
+        if self.x.io.geometry.is_some() {
+            return self.ring(inst, b, i);
         }
         let name = inst.name();
         let guard = self.guard(b, i)?;
@@ -4931,6 +5114,8 @@ impl<'a> Lower<'a> {
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
+        // (a guard with no host value: the instruction's own lowering says so where it needs it)
+        self.raw_use = self.raw_use_for(b, i, inst).unwrap_or(None);
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4955,6 +5140,10 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
+            // A geometry program's emit or cut: a refusal at once, as for the node test.
+            Fields::Sopp { .. } if self.x.io.geometry.is_some() && name.starts_with("s_sendmsg") => {
+                return self.ring_message(b, i).map_err(|why| unsupported(offset, why));
+            }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
@@ -4976,12 +5165,14 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        self.raw_use = None;
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
+                    self.raw.remove(&v);
                 }
                 Ok(())
             }
@@ -5746,6 +5937,10 @@ impl<'a> Lower<'a> {
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
         }
+        if self.scalar.get(&site).is_some_and(|a| a.param == DRIVER) {
+            // (where a geometry program's ring lies in LDS: no ring on the host)
+            return Err("the console driver's table");
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
         };
@@ -5940,7 +6135,8 @@ impl<'a> Lower<'a> {
             if per_lane {
                 self.s.flags |= flags::WAVE_OPS;
                 let i32t = self.s.t.i32;
-                d = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                d = self.helper_own(d, first);
             }
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
@@ -6204,8 +6400,9 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 // A waterfall loop's load at the first lane's offset reads
-                // each lane's own entry (see `resource::Waterfall`).
-                let per_lane = self.x.res.waterfall.loads.contains(load);
+                // each lane's own entry (see `resource::Waterfall`); in a
+                // pixel program a helper lane may have an offset of its own.
+                let per_lane = self.x.res.waterfall.loads.contains(load) || self.helper_scalars;
                 let h = self
                     .s
                     .heap_handle(self.cur, index, sampler, per_lane, props);
@@ -6273,7 +6470,7 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, self.helper_scalars, props))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6291,7 +6488,7 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                Ok(self.s.heap_handle(self.cur, index, sampler, self.helper_scalars, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
@@ -7088,12 +7285,15 @@ impl<'a> Lower<'a> {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
-                    Some(&x) => x,
-                    None => {
-                        let x = self.i32_of(acc)?;
-                        self.as_float(x)
-                    }
+                let acc = match self.floats.get(&acc).copied() {
+                    Some(x) => x,
+                    None => match self.raw_float(acc) {
+                        Some(x) => x,
+                        None => {
+                            let x = self.i32_of(acc)?;
+                            self.as_float(x)
+                        }
+                    },
                 };
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
@@ -7552,7 +7752,12 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    // (not where a dispatch by thread counts may have launched no lower lane:
+                    // `partner_live`)
+                    if guard.is_none()
+                        && super::shader_opt() & super::bitcode::opt::FIRST != 0
+                        && self.partner_live.is_none()
+                    {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has
@@ -9150,7 +9355,7 @@ impl<'a> Lower<'a> {
         let addr_u32 = |l: &mut Self, reg_idx: usize| -> Result<V, Why> {
             let r = *regs.get(reg_idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
         let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
@@ -9970,7 +10175,7 @@ impl<'a> Lower<'a> {
         };
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
-            l.i32_of(v)
+            l.source(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
@@ -10708,7 +10913,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
+                let mut abort = self.abort_block();
+                if self.notes.is_some() {
+                    abort = self.note_block(t, true, abort);
+                }
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
@@ -10754,25 +10962,66 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                let wanted = cond;
+                // A loop that goes round by jumps back alone is left at the
+                // limit where it can leave, so the lane goes on with the
+                // program (its jump back still ends the lane, for a way round
+                // that passes no exit). Taken out of the program there, the
+                // pixels of PS_Textured_Eight's runaway search of its shadow
+                // cascades were discarded: holes in the objects it draws.
+                let leaves = if back(self, taken) || back(self, not_taken) {
+                    None
+                } else {
+                    self.jump_loop_exit(b, taken, not_taken)
+                };
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if let Some((h, stay_taken)) = leaves {
+                    if stay_taken {
+                        let ok = self.limit_test(h, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else {
+                        let stop = self.limit_test(h, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (self.edge(b, taken), self.edge(b, not_taken));
+                // With loop notes, the exit of a counted back edge passes a
+                // block that counts the lanes leaving at the limit.
+                // (the header, and whether the way that stays in the loop is `taken`)
+                let header = match [taken, not_taken].into_iter().find(|&h| back(self, h)) {
+                    Some(h) => Some((h, h == taken)),
+                    None => leaves,
+                };
+                let noted = match header {
+                    Some((h, true)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, not_taken, f, h, wanted, true);
+                        f = x;
+                        Some((not_taken, pred))
+                    }
+                    Some((h, false)) if self.notes.is_some() => {
+                        let (x, pred) = self.note_exit(b, taken, t, h, wanted, false);
+                        t = x;
+                        Some((taken, pred))
+                    }
+                    _ => None,
+                };
                 for (to, via) in [(taken, t), (not_taken, f)] {
                     if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
+                        // From an edge block, or from here (or from the
+                        // block after a note).
+                        let from = match noted {
+                            Some((n, pred)) if n == to => pred,
+                            _ if Some(via) == self.block[to] => self.cur,
+                            _ => via,
                         };
                         self.enter_loop(b, to, from);
                     }
@@ -10793,70 +11042,6 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
-    }
-
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
-        }
-    }
-
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
-        let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        self.s.m.tag(phi, Tag::Counter);
-        self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
-    }
-
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
-            return a;
-        }
-        let a = self.s.m.new_block();
-        if self.s.pixel {
-            let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
-        }
-        self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
-        a
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
@@ -11172,6 +11357,11 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_cs(words, rsrc2).map(|_| ())
+    }
+
+    /// A synthetic compute program with these input registers, lowered.
+    fn lower_cs(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -11200,7 +11390,23 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// A compute program's group id in x is counted from the group the host
+    /// starts its dispatch at (`USER_GROUP_BASE`, a user-data dword the host
+    /// computes): the host runs a dispatch of more than 65,535 groups in x
+    /// as several. Its group id in y is not.
+    #[test]
+    fn group_id_in_x_is_counted_from_the_hosts_base() {
+        use super::super::shader::USER_GROUP_BASE;
+        let base = RootType::Other(USER_GROUP_BASE);
+        // s_cmp_eq_u32 s<reg>, 0; a branch over a move; the end.
+        let program = |reg: u32| [0xBF06_8000 | reg, 0xBF85_0001, 0xBE86_0380, S_ENDPGM];
+        let group_ids_xy = 3 << 7;
+        let x = lower_cs(&program(0), group_ids_xy).expect("reads the group id in x");
+        assert_eq!(x.user_data.iter().filter(|u| u.root == base).count(), 1);
+        let y = lower_cs(&program(1), 2 << 7).expect("reads the group id in y");
+        assert!(y.user_data.iter().all(|u| u.root != base));
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -11489,6 +11695,51 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn a_loop_each_lane_leaves_on_its_own_is_no_code_every_lane_runs() {
+        // The waterfall loop in one block, its branch back on the lanes still
+        // waiting: every lane runs its first pass, only those still waiting
+        // the next ones, so two host waves cannot meet there.
+        use crate::resource::tests::cmpx_waterfall;
+        for wave64 in [false, true] {
+            let words = cmpx_waterfall(wave64, true);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, wave64, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            use crate::structure::LaneExit;
+            let back =
+                |b: usize| matches!(st.exits[b], LaneExit::Branch { taken, .. } if taken == b);
+            let looped = (0..p.blocks.len())
+                .find(|&b| back(b))
+                .expect("a block that branches back to itself");
+            assert!(!all[looped], "wave64 {wave64}");
+            // The code before the loop and after it still is.
+            assert!(all[0], "wave64 {wave64}");
+            assert!(all[p.blocks.len() - 1], "wave64 {wave64}");
+        }
+        // A loop that goes round on a scalar count, with a lane branch inside it that does
+        // not leave it: only the branch's own arm is code not every lane runs.
+        let words = [
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0x7D88_0085, // v_cmp_gt_u32 vcc_lo, 5, v0 (byte 4: the loop)
+            0xBE87_3C6A, // s_and_saveexec_b32 s7, vcc_lo
+            0xBF88_0001, // s_cbranch_execz (past the arm)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1 (byte 16: the arm)
+            0x887E_077E, // s_or_b32 exec_lo, exec_lo, s7 (byte 20)
+            0x8006_8106, // s_add_u32 s6, s6, 1
+            0xBF07_8406, // s_cmp_lg_u32 s6, 4
+            0xBF85_FFF8, // s_cbranch_scc1 (back to byte 4)
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let at = |offset| (0..p.blocks.len()).find(|&b| p.blocks[b].offset == offset).unwrap();
+        assert!(all[at(4)] && all[at(20)] && !all[at(16)]);
     }
 
     #[test]

@@ -27,6 +27,16 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that reads the address out of a buffer descriptor it picks from the view
+/// heap at an index it computes, and uses it as a pointer (the title's sun
+/// shadow tracing takes the address of its ray-tracing structure so): a raw
+/// buffer of 2 x [`SLOT_STRIDES_COUNT`] dwords the host keeps, dwords `2i`
+/// and `2i + 1` the title address of the view at heap slot `i` (low dword,
+/// bits from 32 up; 0 for a slot without a buffer or structure view). As
+/// [`USER_VIEW_ADDRESS`] for a table entry at a fixed place.
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -51,6 +61,21 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// The root UAV `u<SLOT_LOOPS>` in [`ROOT_CBV_SPACE`] of a program translated
+/// with loop notes (`super::loop_notes`, diagnostics builds only): a raw
+/// buffer of [`LOOP_NOTES`] dwords of the program's own (the host binds each
+/// program its own range) where lanes that reached a loop's iteration limit
+/// are counted. [`LOOP_NOTE_DWORDS`] dwords per counted loop, in the order of
+/// their first code byte (any loop past the last shares the last record):
+/// that byte plus 1; the lanes that left the loop at the limit and went on
+/// with the program; the lanes the limit took out of the program (a pixel
+/// discarded, a vertex, mesh or compute lane stopped); a spare dword. A
+/// helper lane of a pixel shader writes nothing, so it is never counted.
+pub const SLOT_LOOPS: u8 = 251;
+/// Dwords of one program's [`SLOT_LOOPS`] range.
+pub const LOOP_NOTES: u32 = 64;
+/// Dwords of one loop's record in a [`SLOT_LOOPS`] range.
+pub const LOOP_NOTE_DWORDS: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -70,13 +95,33 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `RootType::Other` code of a user-data dword the host computes: the
-/// thread-group id in x of the first group of this dispatch, added to the
-/// host's. A dispatch runs at most 65,535 groups in each dimension, the
-/// console's more in x: the host runs the groups past 65,535 of an
-/// indirect record as a second execution with this dword at 65,535, and
-/// sets it to 0 everywhere else. Asked by programs that read the group id
-/// in x.
+/// group to start counting from in x, added to a compute program's group
+/// id in x. A host dispatch runs at most 65,535 groups in each dimension,
+/// and the console's more (the depth-of-field blur asks for up to 115,200,
+/// one per tile of each of its two layers): the host runs such a dispatch
+/// as several, each with its first group here. 0 for any other dispatch.
+/// Not asked by programs with a spilled user-data table (their root
+/// signature is close to the host's 64 dwords).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a compute program translated for dispatches by thread counts
+/// ([`super::translate_thread_limited`]): dword `d` (0 to 2) is the number
+/// of threads the title dispatched along x, y or z (asked only along a
+/// dimension whose groups are more than one thread wide). The console's
+/// `DispatchX` with `USE_THREAD_DIMENSIONS` counts threads, not groups: the
+/// last group along a dimension is cut short, and the threads past the
+/// count are not launched (their lanes are outside EXEC from the start,
+/// and a wave with none is not launched at all).
+pub const USER_THREAD_LIMIT: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`): not 0 while the title's structures have
+/// been built (its structure builder runs). While 0, every node test
+/// answers no hit without reading the node: a box node enters no child,
+/// any other node is a triangle missed. The title's passes run whether or
+/// not anything built the structures, and would otherwise walk whatever
+/// bytes lie where they would be.
+pub const USER_STRUCTURES: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -84,6 +129,10 @@ pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs bound to a stage other than pixel and compute (a root UAV of a
+    /// vertex or mesh program: the loop notes' `SLOT_LOOPS`); without it the
+    /// validator refuses the program ("Flags must match usage").
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
@@ -489,6 +538,10 @@ impl Shader {
                 }
             }
         }
+        let compute = self.threads.is_some() && self.mesh.is_none();
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -802,6 +855,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;

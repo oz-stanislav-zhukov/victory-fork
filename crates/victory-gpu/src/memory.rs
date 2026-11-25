@@ -29,20 +29,24 @@
 //! pair of root constants that is a title address and around each root
 //! constant that is one in 256-byte units (the builder passes structures
 //! all three ways), and the 4 MiB after each (a structure may cross a
-//! window's end).
-//! shortcut: what a stage reaches only through pointers it reads out of
-//! memory (InitHeaders' table of structure addresses, LoadInstances'
-//! instance records) is not made ready unless something else named it;
-//! the fault count in the log says whether that happens. The whole answer
-//! is the extent of the title's allocation around an address, which the
-//! memory module of the layer knows and this one does not ask yet.
+//! window's end); all list upload memory (`crate::list::upload`), where
+//! the builder records the tables its stages read through pointers
+//! (InitHeaders' table of structure addresses); and the title addresses in
+//! the block of upload memory a root view points into (the leaf
+//! rehydration's geometry descriptions: its index and vertex buffers).
+//! shortcut: what a stage reaches only through pointers into other title
+//! memory is not made ready unless something else named it; the fault
+//! count in the log says whether that happens. The whole answer is the
+//! extent of the title's allocation around an address, which the memory
+//! module of the layer knows and this one does not ask yet.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
 //! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
-//! dirty-page mask written by the shader would bound both.
+//! date and, if it can store through an address, declares all of them
+//! written (the bytes are compared on the CPU afterwards, as for any
+//! unordered access view): a dirty-page mask written by the shader would
+//! bound both.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -55,8 +59,11 @@ use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
 /// Copies that can be numbered (the run of heap slots is one longer). A
-/// listed frame of the opening cutscene names about 50 windows.
-const COPIES: u32 = 1023;
+/// listed frame of the opening cutscene names about 50 windows; the
+/// structure builder's dispatches in the user-save scenario 1,125 in their
+/// first frame and about 1,450 in six minutes, low dwords of address pairs
+/// left out (run rt-dry1).
+const COPIES: u32 = 2047;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -115,48 +122,58 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's (`why`: for the trace, `crate::bvhtrace`): the index
+    /// in `copies` of the copy that holds the page, if one does.
+    fn map(&mut self, address: u64, why: &str) -> Option<usize> {
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = why;
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
-            return;
+            return None;
         }
         // SAFETY: inside the directory's mapping.
         let entry = unsafe { self.directory.1.add(page as usize * 2) };
         // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
-            return;
+        let had = unsafe { entry.read() };
+        if had != 0 {
+            return Some(had as usize - 1);
         }
         let start = page * PAGE;
         // A shader's pointer, or a constant taken for an address, may be
         // anything: only memory the title has.
         if self.refused.contains(&page) {
-            return;
+            return None;
         }
         if !crate::texture::committed(start as *const u8, PAGE as usize) {
             self.refused.insert(page);
-            return;
+            return None;
         }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
-        let Some(shadow) = crate::shadow::find(start, 1)
+        let shadow = crate::shadow::find(start, 1)
             .filter(whole)
-            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))
-        else {
-            return;
-        };
+            .or_else(|| crate::shadow::find(start, PAGE).filter(whole))?;
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
                 self.copies.push(shadow.clone());
                 let n = self.copies.len() - 1;
+                #[cfg(feature = "diagnostics")]
+                crate::bvhtrace::line(|| {
+                    let (first, len) = shadow.span();
+                    format!(
+                        "N {} {first:#x}+{len:#x} window={} at {address:#x} why={why}",
+                        n + 1,
+                        shadow.is_window()
+                    )
+                });
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -182,7 +199,7 @@ impl Memory {
                 ONCE.call_once(|| {
                     tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
                 });
-                return;
+                return None;
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
@@ -192,6 +209,7 @@ impl Memory {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
         }
+        Some(n)
     }
 
     /// The pages shaders found empty since the last frame.
@@ -220,30 +238,72 @@ impl Memory {
                 );
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if !pages.is_empty() {
+            crate::bvhtrace::line(|| {
+                let mut sorted = pages.clone();
+                sorted.sort_unstable();
+                let list: Vec<String> = sorted.iter().map(|&p| format!("{:#x}", u64::from(p) * PAGE)).collect();
+                format!("F {} {}", sorted.len(), list.join(" "))
+            });
+        }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.map(u64::from(page) * PAGE, "fault");
         }
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    /// after it (their indices in `copies`).
+    fn name(&mut self, address: u64, why: &str) -> [Option<usize>; 2] {
+        [
+            self.map(address, why),
+            self.map((address & !(CELL - 1)) + CELL, why),
+        ]
     }
+}
+
+/// A key the list is asked about ([`HostList::asked`]) once a shader of
+/// it may store to title memory through an address.
+pub(crate) const STORES: usize = usize::MAX - 0x6f;
+
+/// Bytes of a block of list upload memory looked through for title
+/// addresses, from a root SRV's address on: some 340 geometry descriptions.
+const SCAN: u64 = 16 << 10;
+
+/// The 8-byte values of `bytes` (from an 8-byte boundary) that are title
+/// addresses as the builder writes them: bits 32 to 39 set, nothing above,
+/// and a low dword of 64 KiB or more (as for an address in two constants;
+/// an address that is not the title's memory is refused when named).
+fn title_addresses(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    bytes.chunks_exact(8).filter_map(|q| {
+        let v = u64::from_le_bytes(q.try_into().ok()?);
+        ((1..=0xFF).contains(&(v >> 32)) && v as u32 >= 0x1_0000).then_some(v)
+    })
+}
+
+/// `VICTORY_MEMORY_ALL=1`: every list that runs a shader reaching title
+/// memory by address brings every numbered copy up to date and, if the
+/// shader can store through an address, declares every one written, as
+/// before (see [`ready`]).
+fn all_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_ALL").is_some_and(|v| v == "1"))
 }
 
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
-/// `constants`: its root constants, see the module), every numbered copy
-/// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (and, with `writes`, copied back after). None if the host
-/// cannot hold it; the draw is then dropped.
+/// `constants`: its root constants, see the module; `records`: the root
+/// views of the shader's root SRVs, whose blocks of list upload memory may
+/// hold title addresses), every numbered copy has its view in `heap`'s run
+/// and is brought up to date when `list` is submitted (and, with `writes`,
+/// copied back after). None if the host cannot hold it; the draw is then
+/// dropped.
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
     addresses: &[u64],
     constants: &[u32],
+    records: &[u64],
     writes: bool,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
@@ -258,21 +318,59 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    // The copies the dispatch names, and those of list upload memory.
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        named.extend(m.name(address, "root view").into_iter().flatten());
+    }
+    // List upload memory (`crate::list::upload`): the builder reaches it
+    // through pointers it reads out of its root views. A chunk is a
+    // window; once numbered it stays so.
+    let mut upload = Vec::new();
+    if let Some((start, len)) = crate::list::upload::span() {
+        for chunk in (start..start + len).step_by(crate::list::upload::CHUNK) {
+            upload.extend(m.map(chunk, "upload memory"));
+        }
+    }
+    // Title addresses in the blocks of list upload memory a dispatch reads
+    // through its root SRVs: the builder's leaf rehydration takes its
+    // geometry (index and vertex buffers) by address out of its 48-byte
+    // records there, which no root argument names. In rt-int1, 638 of the
+    // 2,139 such addresses lay in no copy when the stage ran: those leaves
+    // read zeros. The builder fills the records before it records the
+    // dispatch. Looked through up to what the list has handed out (the
+    // block, and those after it), [`SCAN`] bytes at most.
+    for &address in records {
+        let Some(handed) = crate::list::upload::handed_end(address) else {
+            continue;
+        };
+        let from = address & !7;
+        let end = handed.min(address.saturating_add(SCAN));
+        if end <= from {
+            continue;
+        }
+        let mut bytes = vec![0u8; (end - from) as usize];
+        if crate::host::read_into(from as *const u8, &mut bytes) {
+            for pointer in title_addresses(&bytes) {
+                named.extend(m.name(pointer, "address in upload memory").into_iter().flatten());
+            }
+        }
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
     // memory nothing reads; one that is not the title's memory is refused.
+    // The low dword of a pair is not taken in 256-byte units as well: of
+    // the windows the builder's dispatches named that way, 717 of 802 in
+    // its first frame were such low dwords (run rt-trace8, which ran out of
+    // numbers in that frame), 2,144 of 2,256 over a run (rt-dry1).
     for (i, &c) in constants.iter().enumerate() {
         if let Some(&high) = constants.get(i + 1)
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
-        }
-        if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            named.extend(m.name(u64::from(c) | u64::from(high) << 32, "constant pair").into_iter().flatten());
+        } else if c >= 0x0100_0000 {
+            named.extend(m.name(u64::from(c) << 8, "constant in 256 bytes").into_iter().flatten());
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -290,21 +388,51 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
+    if writes {
+        list.first_use(STORES);
+    }
+    if all_copies() {
+        // Once per list, and for copies numbered since.
+        let first_write = writes && list.first_use(WRITE);
+        for (n, shadow) in m.copies.iter().enumerate() {
+            let (start, len) = shadow.span();
+            if first_read || n >= numbered {
+                shadow.refresh(list, start, len);
+            }
+            if writes && (first_write || n >= numbered) {
+                shadow.gpu_writes(list, start, len);
+            }
         }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+    } else {
+        // Brought up to date at the list's submission: a copy just
+        // numbered, and each copy the list's dispatches name and the list
+        // upload memory's, once per list; declared written, with `writes`,
+        // the first two. All numbered copies for every list cost the
+        // builder's steady frames (360 dispatches naming 100 windows) a
+        // compare of the 1,023 numbered windows, 4 GiB, after each list:
+        // with its dispatches bound and not run, a median of 975 ms a frame
+        // (run rt-dry1) against 353 for the scene without the builder
+        // (rt-off1, the machine shared with other runs' builds).
+        // shortcut: memory a stage reaches only through pointers, in a copy
+        // no dispatch names, is brought up to date once, when numbered: the
+        // title's writes to it after that are not seen; and the stage's
+        // writes there are not copied back into title memory (shaders read
+        // them from the copy; a page the title writes later is copied over
+        // them).
+        // (Per list and copy: one key for the refresh, one for the writes.)
+        const NAMED: usize = usize::MAX - (1 << 32);
+        for n in (numbered..m.copies.len()).chain(named).chain(upload.iter().copied()) {
+            let Some(shadow) = m.copies.get(n) else { continue };
+            let (start, len) = shadow.span();
+            if list.first_use(NAMED + 2 * n) {
+                shadow.refresh(list, start, len);
+            }
+            if writes && !upload.contains(&n) && list.first_use(NAMED + 2 * n + 1) {
+                shadow.gpu_writes(list, start, len);
+            }
         }
     }
     if first_read {
@@ -316,4 +444,20 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn title_addresses_are_found_in_geometry_records() {
+        // A geometry description as the builder copies it into upload memory
+        // (48 bytes): no transform, index and vertex formats, counts, the
+        // index buffer, the vertex buffer and its stride.
+        let mut record = Vec::new();
+        for v in [0u64, 0x10_0000_0035, 0x508_0000_1263, 0xb_13f6_53a0, 0xb_13f0_8bc0, 8] {
+            record.extend_from_slice(&v.to_le_bytes());
+        }
+        let found: Vec<u64> = super::title_addresses(&record).collect();
+        assert_eq!(found, [0xb_13f6_53a0, 0xb_13f0_8bc0]);
+    }
 }

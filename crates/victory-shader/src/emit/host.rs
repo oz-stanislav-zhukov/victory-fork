@@ -17,6 +17,22 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// The devices made so far, the default adapter's and WARP's, each made
+/// once and kept until the process ends ([`Host::new`]). The NVIDIA
+/// driver's own threads outlive a device's release: two test sessions on
+/// an RTX 5090 (driver 32.0.16.1742, waves 1 and 3) died in
+/// `nvwgf2umx.dll`+0x719ea6, where a thread of the driver read an object
+/// already freed while the test thread was building its scene on the CPU,
+/// the test before having released its devices (the 32-bit node test over
+/// title memory, whose two runs each make and drop one).
+static DEVICES: std::sync::Mutex<[Option<KeptDevice>; 2]> = std::sync::Mutex::new([None, None]);
+
+/// A device kept in [`DEVICES`].
+struct KeptDevice(ID3D12Device);
+
+// SAFETY: a D3D12 device is free-threaded; it is only cloned from here.
+unsafe impl Send for KeptDevice {}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -63,9 +79,21 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`): the
+    /// same device for every call of a process ([`DEVICES`]).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let mut kept = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(KeptDevice(device)) = &kept[usize::from(warp)] {
+            return Ok(Host { device: device.clone() });
+        }
+        let made = Self::make(warp)?;
+        kept[usize::from(warp)] = Some(KeptDevice(made.device.clone()));
+        Ok(made)
+    }
+
+    /// A new device of the default adapter, or of WARP.
+    fn make(warp: bool) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
@@ -144,6 +172,16 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_with(stages, false)
+    }
+
+    /// [`Host::root_signature_for`]; with `bounded`, each root UAV is a
+    /// table of one view, as the layer binds them.
+    fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        bounded: bool,
+    ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -169,7 +207,31 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, kind) in views {
+        let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = views
+            .iter()
+            .map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                NumDescriptors: 1,
+                BaseShaderRegister: u32::from(slot),
+                RegisterSpace: super::ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
+        for (n, &(slot, kind)) in views.iter().enumerate() {
+            if bounded && kind == 2 {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &ranges[n],
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -242,6 +304,18 @@ impl Host {
         cs: &HostShader,
     ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
         let root = self.root_signature_for(&[(cs, D3D12_SHADER_VISIBILITY_ALL)])?;
+        let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
+        Ok((root, pso))
+    }
+
+    /// [`Host::compute_pipeline`] with each root UAV a table of one view
+    /// (bound by [`Root::Uav`]).
+    #[cfg(test)]
+    pub fn compute_pipeline_bounded(
+        &self,
+        cs: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_with(&[(cs, D3D12_SHADER_VISIBILITY_ALL)], true)?;
         let pso = self.compute_pipeline_with(&root, &cs.dxil)?;
         Ok((root, pso))
     }
@@ -508,9 +582,28 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// A pipeline of the geometry shader `gs` between a vertex shader that
+    /// feeds its inputs ([`stub_vs`]) and the pixel shader that reads
+    /// nothing ([`stub_ps`]); the geometry stage's user data is root
+    /// parameter 1.
+    pub fn geometry_pipeline(
+        &self,
+        gs: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let (vs, ps) = (stub_vs(gs)?, stub_ps());
+        let root = self.root_signature_for(&[
+            (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (&ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
 }
 
-/// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
+/// A vertex shader that feeds `ps`'s inputs (zeros) and a position (`ps`
+/// may be a geometry shader).
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
     let mut outputs: Vec<SigElement> = inputs
@@ -619,6 +712,16 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV over a buffer that starts with these dwords, as a table of
+    /// one raw view of the buffer (bounded, as the layer binds root UAVs:
+    /// an access past its end is dropped) for a root signature from
+    /// [`Host::compute_pipeline_bounded`] ([`Host::dispatch`] only); its
+    /// contents come back after the heap's UAVs, in the order of the roots.
+    Uav(Vec<u32>),
+    /// A root UAV over the same buffer as the [`Root::Uav`] bound to root
+    /// parameter `n` (earlier in the list): two views of one memory, as
+    /// the title binds a structure it rewrites in place.
+    UavAlias(u32),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -856,7 +959,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) | Root::UavAlias(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1144,7 +1247,11 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            let root_views = d.roots.iter().filter(|r| matches!(r.1, Root::Uav(_) | Root::UavAlias(_))).count();
+            // The buffer of each root parameter bound by `Root::Uav`, for aliases.
+            let mut by_param: Vec<(u32, ID3D12Resource, u64)> = Vec::new();
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len() + root_views)?;
+            let mut next_root_view = d.views.len();
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -1154,6 +1261,8 @@ impl Host {
             let mut keep = Vec::new();
             // UAVs: (resource, dwords or texture size, readback buffer).
             let mut uavs = Vec::new();
+            // Root UAVs, the same way: after the heap's.
+            let mut root_uavs = Vec::new();
             for (i, v) in d.views.iter().enumerate() {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
@@ -1391,8 +1500,73 @@ impl Host {
                         }
                         keep.push(b);
                     }
+                    Root::Uav(data) => {
+                        let bytes = (data.len() as u64 * 4).max(4);
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let from = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &from, 0, bytes);
+                        list.ResourceBarrier(&[transition(
+                            &b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: (bytes / 4) as u32,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                        at.ptr += next_root_view * view_size;
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let mut table = views.GetGPUDescriptorHandleForHeapStart();
+                        table.ptr += (next_root_view * view_size) as u64;
+                        next_root_view += 1;
+                        list.SetComputeRootDescriptorTable(*param, table);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        by_param.push((*param, b.clone(), bytes));
+                        root_uavs.push((b, None, (bytes / 4) as u32, rb));
+                        keep.push(from);
+                    }
+                    Root::UavAlias(of) => {
+                        let Some((_, b, bytes)) = by_param.iter().find(|x| x.0 == *of).cloned() else {
+                            return Err("an alias of a root UAV not bound before it".into());
+                        };
+                        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_UAV {
+                                    NumElements: (bytes / 4) as u32,
+                                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                        at.ptr += next_root_view * view_size;
+                        dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        let mut table = views.GetGPUDescriptorHandleForHeapStart();
+                        table.ptr += (next_root_view * view_size) as u64;
+                        next_root_view += 1;
+                        list.SetComputeRootDescriptorTable(*param, table);
+                    }
                 }
             }
+            uavs.append(&mut root_uavs);
             let [x, y, z] = d.groups;
             list.Dispatch(x, y, z);
             for (r, size, n, rb) in &uavs {

@@ -69,6 +69,14 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Mesh programs whose outputs pass D3D12's 32 KiB alone, checked as linked for a
+    /// pipeline whose pixel program reads none of them (`emit::link_mesh_alone`).
+    ms_linked: usize,
+    /// The same for geometry programs.
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
+    gs_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -130,6 +138,11 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.ms_linked += other.ms_linked;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
+        self.gs_pipelines += other.gs_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -358,8 +371,13 @@ pub fn run(
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
     );
     println!(
-        "             {} emitted of {} mesh programs; {} validated, {} pipelines",
-        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+        "             {} emitted of {} mesh programs; {} validated, {} pipelines \
+         ({} of them over 32 KiB alone, checked as linked without the outputs no pixel program reads)",
+        t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines, t.ms_linked
+    );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated, {} pipelines",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.gs_pipelines
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -495,7 +513,7 @@ fn translate(
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
-    translate_programs(&container, programs, &example, t, checks);
+    translate_programs(&container, &bytes, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
@@ -508,7 +526,14 @@ fn translate(
     }
 }
 
-fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
+fn translate_programs(
+    container: &Container,
+    bytes: &[u8],
+    programs: Vec<NativeProgram>,
+    example: &dyn Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -538,7 +563,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs) {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -576,7 +601,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
-                            check(shader, t, checks, label);
+                            check(shader, bytes, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t
                             .fail(format!("emit: {what}"), || {
@@ -598,7 +623,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
 }
 
 /// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
-/// its label, the console program's instructions by encoding class (a
+/// its label, the form a console wave64 compute program took on the host
+/// (`emit::forms`), the console program's instructions by encoding class (a
 /// static count of the whole program, not of one thread's path), and the
 /// host module's instructions by kind (`emit::census::KINDS`).
 fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
@@ -631,7 +657,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         };
         console[k] += 1;
     }
-    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    let mut line = format!("{label}\twave64={}\tform={}", u8::from(native.wave64), emit::forms::form_of(&shader.dxil));
     for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }
@@ -642,9 +668,10 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     let _ = lock(out).write_all(line.as_bytes());
 }
 
-/// Validates an emitted shader if asked to.
+/// Validates an emitted shader if asked to (`container`: the console's, as translated).
 fn check(
     mut shader: emit::HostShader,
+    container: &[u8],
     t: &mut Tally,
     checks: &mut Checks,
     label: impl Fn() -> String,
@@ -665,11 +692,23 @@ fn check(
             &shader.dxil,
         );
     }
+    // A mesh program whose outputs pass D3D12's 32 KiB as translated alone never gets a
+    // pipeline as it is: the runtime links it with its pixel program, or leaves out every
+    // output only a pixel program would read when there is none (`emit::link_mesh_alone`).
+    // The stub pixel program below reads none of them, so that is the form checked here.
+    if shader.stage == HwStage::Ms
+        && !emit::mesh_fits(&shader.dxil).unwrap_or(true)
+        && let Ok(Some(linked)) = emit::link_mesh_alone(container, &shader)
+    {
+        t.ms_linked += 1;
+        shader = linked;
+    }
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+            HwStage::Gs => h.geometry_pipeline(&shader).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
         match made {
@@ -737,6 +776,12 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_validated,
             &mut t.ms_pipelines,
         ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.gs_pipelines,
+        ],
         _ => [
             &mut t.emit_programs,
             &mut t.emitted,
@@ -801,15 +846,12 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
         };
         // Heaps hold dynamic resources, which no used entry lists; code
-        // tables are no root parameter.
+        // tables, title memory and the driver's table are no root parameter.
         if let Some(a) = a
-            && a.param != resource::CODE
-            && !matches!(
-                p.layout[a.param].root,
-                RootType::ResourceHeap | RootType::SamplerHeap
-            )
+            && let Some(l) = p.layout.get(a.param)
+            && !matches!(l.root, RootType::ResourceHeap | RootType::SamplerHeap)
         {
-            traced.insert(p.layout[a.param].user_data);
+            traced.insert(l.user_data);
         }
     }
     // Root constants are listed as a CBV, read straight from the SGPRs.

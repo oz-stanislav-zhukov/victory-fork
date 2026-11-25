@@ -49,9 +49,11 @@ pub(crate) fn counts() -> (u64, u64) {
 /// wave size is never filed under the later key.
 fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+    let limits = victory_shader::emit::loop_limits();
+    if limits != victory_shader::emit::DEFAULT_LOOP_LIMITS {
+        WARNED.call_once(|| {
+            tracing::warn!(?limits, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop elsewhere")
+        });
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {
@@ -97,6 +99,23 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
+        None => translate(container),
+    }
+}
+
+/// The translation of a console compute program for dispatches by thread
+/// counts whose last groups are cut short
+/// (`victory_shader::emit::translate_thread_limited`), from the cache when
+/// there is one, under a key of its own.
+pub(crate) fn host_shader_thread_limited(container: &[u8]) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| victory_shader::emit::translate_thread_limited(c).map_err(|e| e.to_string());
+    match CACHE.get() {
+        Some(cache) => {
+            let mut key = blake3::Hasher::new();
+            key.update(&build());
+            key.update(b"thread counts\0");
+            cached(cache, key.finalize().as_bytes(), container, translate)
+        }
         None => translate(container),
     }
 }

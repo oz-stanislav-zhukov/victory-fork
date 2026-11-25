@@ -3315,6 +3315,37 @@ pub(crate) fn settle_now(why: usize) {
     host.settle(&mut submitted, why);
 }
 
+/// Title memory `[address, address + len)` is about to show other physical
+/// pages: a queue's page-mapping copy, which the console runs behind the
+/// work sent before it. Flights in the air ([`late`]) whose shaders may
+/// write that memory land first, so what they wrote reaches the pages it
+/// was written to; landed after, it went to the pages mapped in their place
+/// (another resource's, shown at other addresses too).
+/// `VICTORY_REMAP_LAND=0`: as before, the pages are mapped at once.
+pub(crate) fn land_before_remap(address: u64, len: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !late() || len == 0 || !*ON.get_or_init(|| std::env::var_os("VICTORY_REMAP_LAND").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let (from, to) = (address as usize, address.saturating_add(len) as usize);
+    let pending = {
+        let line = line();
+        line.settling || touches(&line.written, from, to)
+    };
+    if !pending {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::bvhtrace::line(|| format!("L {address:#x}+{len:#x} flights land before the pages change"));
+    if relay() {
+        // Only until the flights that may write there have landed (the
+        // landing thread recomputes `written` from those still in the air).
+        relay_wait(WHY_SYNC, |line| !line.settling && !touches(&line.written, from, to));
+    } else {
+        settle_now(WHY_SYNC);
+    }
+}
+
 /// [`settle_now`] at a present, and for a fence the title blocks on.
 pub(crate) fn settle_for_present() {
     settle_now(WHY_SYNC);
@@ -3805,6 +3836,10 @@ fn read_backs(list: &HostList) {
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                #[cfg(feature = "diagnostics")]
+                if crate::bvhtrace::armed() {
+                    crate::bvhtrace::line(|| format!("B {at:#x}+{:#x} rows {rows} of {row}", (*rows).saturating_sub(1) * pitch + row));
+                }
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
@@ -6645,6 +6680,74 @@ impl HostList {
         deferred.refreshed.clear();
     }
 
+    /// Whether shaders recorded in the list so far may write title memory
+    /// `[address, address + len)`: a range they declared written
+    /// ([`Shadow::gpu_writes`](crate::shadow::Shadow::gpu_writes)) holds a
+    /// part of it.
+    pub(crate) fn shaders_wrote(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.deferred()
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::GpuWrite(_, at, n) if *at < end && address < at.saturating_add(*n)))
+    }
+
+    /// A title buffer copy of `len` bytes from `src` to `dst` (title
+    /// addresses) whose source shaders recorded earlier in the list write:
+    /// run on the card, between the two host copies, behind those shaders,
+    /// and the destination declared written, so that it reaches title memory
+    /// when the list has run. At submission, where the CPU does a title's
+    /// copy, the shaders have not run yet: the copy took what the source
+    /// held before them. (The structure builder's sizes after a build,
+    /// which the title copies out of the builder's buffer this way to read
+    /// them, came out as the previous frame's or as zeros.) False if either
+    /// side has no host copy; the caller then copies at submission.
+    pub(crate) fn copy_on_card(&self, dst: u64, src: u64, len: u64) -> bool {
+        use windows::core::Interface;
+        let (Some(from), Some(to)) = (crate::shadow::find(src, len), crate::shadow::find(dst, len)) else {
+            return false;
+        };
+        let Ok(l7) = self.list.cast::<ID3D12GraphicsCommandList7>() else {
+            return false;
+        };
+        // The destination's title bytes first; then its range is the card's.
+        to.refresh(self, dst, len);
+        to.gpu_writes(self, dst, len);
+        let barrier = |before_sync, after_sync, before, after| D3D12_GLOBAL_BARRIER {
+            SyncBefore: before_sync,
+            SyncAfter: after_sync,
+            AccessBefore: before,
+            AccessAfter: after,
+        };
+        let barriers = |b: &[D3D12_GLOBAL_BARRIER]| D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: b.len() as u32,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: b.as_ptr() },
+        };
+        let before = [barrier(
+            D3D12_BARRIER_SYNC_ALL,
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST,
+        )];
+        let after = [barrier(
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_SYNC_ALL,
+            D3D12_BARRIER_ACCESS_COPY_DEST,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_COPY_SOURCE,
+        )];
+        // SAFETY: an open list; both buffers are live host copies the list
+        // keeps until it is reset.
+        unsafe {
+            l7.Barrier(&[barriers(&before)]);
+            self.list.CopyBufferRegion(&to.buffer, to.offset(dst), &from.buffer, from.offset(src), len);
+            l7.Barrier(&[barriers(&after)]);
+        }
+        self.keep(&to.buffer);
+        self.keep(&from.buffer);
+        true
+    }
+
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -6963,6 +7066,13 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list asked about `key` since its reset ([`first_use`]).
+    ///
+    /// [`first_use`]: HostList::first_use
+    pub(crate) fn asked(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -6999,6 +7109,10 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    if crate::bvhtrace::armed() {
+                        crate::bvhtrace::line(|| format!("C {dst:#x}+{len:#x} from {src:#x}"));
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7469,6 +7583,14 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    if crate::bvhtrace::armed() {
+        crate::bvhtrace::line(|| {
+            // SAFETY: the caller's source holds `len` bytes.
+            let head = unsafe { std::slice::from_raw_parts(src, len.min(32)) };
+            format!("W {:#x}+{len:#x} {}", dst as usize, crate::bvhtrace::hex(head))
+        });
+    }
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -7485,16 +7607,19 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    if len != 0 && !write(dst as usize, len) {
+        for_pieces(dst as usize, len, 64 << 10, |at, n| {
+            if !write(at, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    write(at, n);
+                });
+            }
+        });
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
-    });
+    #[cfg(feature = "diagnostics")]
+    if crate::bvhtrace::armed() {
+        crate::bvhtrace::put_back(dst as u64, len as u64);
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -7894,6 +8019,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                crate::loop_notes::log();
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

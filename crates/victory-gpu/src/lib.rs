@@ -16,6 +16,8 @@
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
+mod bvhtrace;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
@@ -40,6 +42,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod loop_notes;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
