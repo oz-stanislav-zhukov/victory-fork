@@ -158,6 +158,7 @@ fn pass_through() -> (HostShader, HostShader) {
         stage,
         dxil: s.finish(),
         user_data: Vec::new(),
+        half_views: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),

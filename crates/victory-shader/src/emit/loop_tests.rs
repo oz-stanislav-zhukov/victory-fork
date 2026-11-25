@@ -201,6 +201,7 @@ fn host_shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
         stage,
         dxil,
         user_data: Vec::new(),
+        half_views: Vec::new(),
         samplers: Vec::new(),
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),

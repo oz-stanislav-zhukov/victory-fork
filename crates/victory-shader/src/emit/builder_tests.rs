@@ -541,6 +541,7 @@ fn lowered_for(native: &NativeProgram, limited: bool) -> Result<HostShader, crat
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        half_views: Vec::new(),
         samplers: lowered.samplers,
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
