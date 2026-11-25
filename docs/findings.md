@@ -90,3 +90,10 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 - In-game stats panel like "Kitty Runtime" (user screenshot, 2026-11-25): title + big fps, then a row FRAME / GPU WAIT / CPU PREP / COPY-BACK in ms, then draws/frame, dropped/frame, RAM. Base: `crates/victory-gpu/src/fpsbox.rs` (fxceless ca8829ff, fps drawn into the top-left corner, `VICTORY_FPS_COUNTER=0` off). The numbers already exist in the frame line (host.rs "fps, ms/frame (preparing ...; on the GPU; copying back ...)"). Make it a small dark panel with labels; switch to toggle.
 - Split #927 vs #934 for the grey wall blotches (fork-934 has #934 + #1002 without #927).
 - Ambient counters threshold 2000 too high (never printed in 13 min): lower to ~200.
+
+## Where we stand (2026-11-25, end of session)
+- Best picture: fork-skin / fork-934 line (Z7-Z8): bright cell, walls fine, skin noise gone on the guard's arms (#934/#927). Best speed: fork-fast + speed switches (Z9): 4.7-5.1 fps, but the cell is dark again and cutscenes blow out white.
+- NEXT 1: bisect Z9's switches for the darkness, one per run, same fork-fast build: drop BACK_OWN_VIEW first, then JOIN_PARTS, then ASYNC_SUBMIT+QUEUE2, then INDIRECT_GATHER. If none: fork-fast without switches (the code itself: fxceless main or #1002).
+- NEXT 2: split #934 vs #927 (grey wall blotches): fork-934 run with base switches.
+- NEXT 3: stats panel (TODO), ambient counter threshold, Qwen reports 05b-09.
+- Qwen research loop keeps running (F:\Workictory-runlogs\qwenesearch, STOP file stops it).
