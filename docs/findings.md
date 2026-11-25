@@ -52,6 +52,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | fxceless #999 | skipped | water/boat texture readback, not our issue |
 | JMAN #533 | skipped | old upstream issue, closed there |
 | Belobug ASYNC_SUBMIT (bdecda30, cf57ca33, 9b89ec2d) | pending | conflicts in host.rs/list.rs/queue.rs |
+| fxceless #1002 | merged (fork-934, fork-fast) | tiled sun-shadow programs exact on 32-lane: orange blocks on hair |
+| fxceless main 465b94f5, 39731795, ca8829ff, d510ee4a | merged (fork-fast) | INDIRECT_GATHER, JOIN_PARTS, BACK_OWN_VIEW: 9.6-10.3 fps in the first rooms on their RTX 4070 |
 | Candidates: fxceless #995 #1014 #1013 #1006 #934 #927, Zettrox #99, Belobug 72e748ea | pending | see Qwen research reports |
 
 ## Open problems
@@ -60,7 +62,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 2. Lucia's eyes glow white/blue in close-ups.
 3. Black walls with white 'peeled' patches in the big common hall (Z6); the corridor was black in Z4 but fine in Z6. Area/material dependent; which Z6 change fixed the corridor is not yet split. User (Z6): a table in the hall goes black and comes back: flicker, so lighting/ambient per frame or re-uploads, not a broken texture.
 4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
-5. Rays: builder runs but darkens the image and doubles GPU time.
+5. Rays: builder runs but darkens the image and doubles GPU time. Qwen 04: tree is partly garbage (our translator drops s_waitcnt: Belobug 72e748ea adds UAV fences around atomics; empty +-inf boxes occlude everything, fxceless #16); quarantine leaks (#1013). Even fixed, ~88 ms more GPU a frame: parked while fps is the priority.
+5b. Hair blocks: Qwen 03 -> fxceless #1002 (CS_ShadowRenderTiled* on 32-lane hosts, matches fxceless #62 word for word). Merged on fork-934/fork-fast.
 6. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
 
 ## Clean-up log
