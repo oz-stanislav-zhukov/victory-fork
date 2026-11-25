@@ -28,7 +28,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 |---|---|---|
 | Skin rainbow speckle = stale textures the texture guard misses | Z6 with `VICTORY_TEXTURE_GUARD=0` (hash every check) | REFUTED: waitress face still speckled. Look at the skin shader instead |
 | `VICTORY_TEXTURE_GUARD=0` is free (fxceless#652: "not slower") | Z6 vs Z4 frame lines | FALSE here: textures 41-51 ms / 170-220 MB a frame vs 6-26 ms / 25-85 MB; preparing 135-144 vs 72-95 ms; cell 3.2-3.6 vs 4.0-5.3 fps; big hall (9.6k draws) 2 fps. Keep the guard ON |
-| Black corridor walls = strong ambient AO | Z4, AO back to default | REFUTED (walls stayed black). Walls fine in Z6 (guard off and/or #148/#994): not yet split which |
+| Black corridor walls = strong ambient AO | Z4, AO back to default | REFUTED (walls stayed black) |
+| Black walls fixed by guard off / #148 / #994 | Z6 | REFUTED: walls fine early in Z6 (corridor at ~21:52), black again later in the same run (~22:00, first mission). Time/streaming dependent: also fine in Z2, black later in Z4 |
 | Darkness with builder on = ambient switched off | Z5 log `ambient ... shaded=true` | REFUTED: ambient on; ray passes occlude it |
 | Builder crash at world entry (0xffff... read) | Z5 with #994 | FIXED by #994 (thread-count dispatches) |
 | #2473 (Marvisak) affects us | code read | NO: needs `VICTORY_REFRESH_ONCE=1`, off here |
@@ -55,9 +56,10 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Open problems
 1. Waitress (and cellmate, guard arms) skin rainbow speckle: not the texture guard. Suspect skin/SSS shader.
 2. Lucia's eyes glow white/blue in close-ups.
-3. Orange 8x8 blocks on Lucia's hair (common room, Z6).
-4. Rays: builder runs but darkens the image and doubles GPU time.
-5. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
+3. Black walls with white patches appear after some minutes in the world (fine at first, same run): degradation over time or streaming, not a build difference.
+4. Orange 8x8 blocks on Lucia's hair (common room, Z6).
+5. Rays: builder runs but darkens the image and doubles GPU time.
+6. fps 3-4: copy-up ~90, GPU ~150, copy-back ~170 ms.
 
 ## Clean-up log
 | Date | Removed | Why |
