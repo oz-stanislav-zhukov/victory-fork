@@ -86,6 +86,21 @@ pub(crate) static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Shaders that did not translate, since the start (for the window text).
 static UNTRANSLATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The pipeline numbers as lines (for the panel's window).
+pub(crate) fn stat_lines() -> Vec<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    vec![
+        format!(
+            "PIPELINES  queue {}  made {}  from disk {}  refused {}",
+            make::waiting(),
+            library::MADE.load(Relaxed),
+            library::LOADED.load(Relaxed),
+            REFUSED.load(Relaxed),
+        ),
+        format!("SHADERS    translated {}  failed {}", KEPT[2].load(Relaxed), UNTRANSLATED.load(Relaxed)),
+    ]
+}
+
 /// The pipeline part of the window text: queued, made, loaded from the
 /// driver's cache, refused; shaders translated and not.
 pub(crate) fn caption() -> String {
