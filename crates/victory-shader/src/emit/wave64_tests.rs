@@ -975,3 +975,44 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+/// `ds_add_u32` of a negated value (and `ds_sub_u32`): host compilers turn an atomic addition
+/// of `0 - x` on group-shared memory into a subtraction DXIL does not have, and NVIDIA's
+/// driver and WARP then refuse the pipeline (E_OUTOFMEMORY; compute 7f61193d2c0e5f22). The
+/// lowering makes it a compare-exchange loop instead. 32 threads each take 1 from 64.
+#[test]
+fn an_lds_addition_of_a_negated_value_is_a_compare_exchange_loop() {
+    for (atomic, name) in [(0xD800_0000u32, "ds_add_u32 of 0 - 1"), (0xD804_0000, "ds_sub_u32 of 0 - 1 (adds)")] {
+        let words = [
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_02C0, // v_mov_b32 v4, 64
+            0xD834_0000, 0x0000_0403, // ds_write_b32 v3, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x4C02_0A80, // v_sub_nc_u32 v1, 0, v5
+            atomic, 0x0000_0103, // ds_add_u32 / ds_sub_u32 v3, v1
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF8A_0000, // s_barrier
+            0xD8D8_0000, 0x0600_0003, // ds_read_b32 v6, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 6 << 8, // buffer_store_dword v6, off, s[8:11], 0
+        ];
+        let mut native = native_of(&words, false, 32);
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 |= 1 << 15; // 128 dwords of LDS
+        }
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered_for_width(&native, &p, &HashSet::new(), 32).expect(name);
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(got) = on_the_card(&shader, [0, 0]) else { return };
+        // ds_sub of -1 adds 1 per thread
+        let expected = if name.starts_with("ds_add") { 32 } else { 96 };
+        assert_eq!(got, expected, "{name}");
+    }
+}

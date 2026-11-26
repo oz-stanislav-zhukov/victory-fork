@@ -339,6 +339,15 @@ impl Module {
         }
     }
 
+    /// `x` when `v` is `sub 0, x` (an integer negation); `None` for anything else.
+    pub fn negated(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Sub, a, x) if self.int_value(a) == Some(0) => Some(x),
+            _ => None,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

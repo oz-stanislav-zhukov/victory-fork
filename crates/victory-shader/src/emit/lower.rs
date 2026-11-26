@@ -5222,10 +5222,20 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let at = self.begin_guarded(guard);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        // A subtraction, or an addition of a negated value (which host compilers turn into
+        // one): group-shared memory has no atomic subtraction in DXIL, and the D3D12 drivers
+        // refuse such a pipeline (E_OUTOFMEMORY from NVIDIA's and from WARP), so it is a
+        // compare-exchange loop.
+        let subtract = match rmw {
+            Some(Rmw::Sub) => Some(v0),
+            Some(Rmw::Add) => self.s.m.negated(v0),
+            _ => None,
+        };
+        let r = match (rmw, subtract) {
+            (Some(_), Some(x)) => self.lds_subtract(p, x),
+            (Some(op), None) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
-            None => self
+            (None, _) => self
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
@@ -5248,6 +5258,24 @@ impl<'a> Lower<'a> {
     /// numbers compare as floats with -0 below +0.
     // shortcut: f32 denormals compare as kept; with the console's MODE
     // flushing them they would order as ±0 first (MODE is not modelled).
+    /// Subtracts `x` from the LDS dword at `p` atomically, with a compare-exchange loop; the
+    /// old value returns (`ds_sub_u32`, see the caller).
+    fn lds_subtract(&mut self, p: V, x: V) -> V {
+        let pre = self.cur;
+        let init = self.s.m.load(pre, p);
+        let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(pre, Term::Br(lp));
+        let i32t = self.s.t.i32;
+        let old = self.s.m.phi(lp, i32t);
+        let new = self.s.m.bin(lp, Bin::Sub, old, x);
+        let prev = self.s.m.cmpxchg(lp, p, old, new);
+        let done = self.s.m.cmp(lp, pred::EQ, prev, old);
+        self.s.m.set_phi(old, vec![(init, pre), (prev, lp)]);
+        self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+        self.cur = exit;
+        old
+    }
+
     fn lds_float_min_max(&mut self, p: V, data: V, max: bool) -> V {
         let pre = self.cur;
         let init = self.s.m.load(pre, p);
