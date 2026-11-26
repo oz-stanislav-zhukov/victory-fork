@@ -86,6 +86,8 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 |---|---|---|
 | 2026-11-25 | fxceless #148, #891, #917, #950 (x2) | Windows 10 results, #854 builds all pipelines, ambient + shade on NVIDIA, #854 for Arc hangs |
 | 2026-11-25 | [fxceless #652](https://github.com/fxceless/victory-fork/issues/652#issuecomment-7169362050) | `TEXTURE_GUARD=0` costs 40-60 ms here, does not clear skin noise, blackens the hall |
+| 2026-11-26 | [fxceless #1319](https://github.com/fxceless/victory-fork/issues/1319#issuecomment-7199102872) | 5060 Ti/Win10 confirmation (720p, AMBIENT_AIR 0.8, avm #82+#109), post-binocular breakup still open, N6 warning (VItoriaBr #107 + DexNom #61 shader commits -> slabs on water). Also seen there: Proudnoob4's branch nvidia-hybrid-v2 (f3c8a1f) has av#82/#109/cool_fox/fx#907/klbf#57 -> candidate base |
+| 2026-11-26 | [Pavl3000/cgbj-fork #1](https://github.com/Pavl3000/cgbj-fork/issues/1) | Win10 Agility crash + fix branch; Series S skin, 011735ff blur, black sun |
 | 2026-11-25 | [fxceless #994](https://github.com/fxceless/victory-fork/pull/994#issuecomment-7169362576) | builder runs 11 min on Win10/5060 Ti without CBV cap, but darker and GPU 172->272 ms |
 
 ## TODO
