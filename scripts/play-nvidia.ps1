@@ -26,7 +26,8 @@ param(
     [hashtable]$More = @{},
     [switch]$Warm,
     [switch]$WarmAll,
-    [string[]]$WarmArgs = @()
+    [string[]]$WarmArgs = @(),
+    [string]$VictoryExe
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -89,6 +90,7 @@ $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureI
 Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if ($VictoryExe) { $victory = $VictoryExe }   # another build (bisecting)
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
 if (-not $NoSmoothMotion) {
