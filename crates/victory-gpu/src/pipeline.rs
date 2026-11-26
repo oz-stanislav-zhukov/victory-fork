@@ -81,6 +81,26 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// kept and the bytes of their host code. None of them is ever let go.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Host pipelines the host refused, since the start (for the window text).
+pub(crate) static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Shaders that did not translate, since the start (for the window text).
+static UNTRANSLATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The pipeline part of the window text: queued, made, loaded from the
+/// driver's cache, refused; shaders translated and not.
+pub(crate) fn caption() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        " | pipes queue {} made {} disk {} refused {} | shaders {} bad {}",
+        make::waiting(),
+        library::MADE.load(Relaxed),
+        library::LOADED.load(Relaxed),
+        REFUSED.load(Relaxed),
+        KEPT[2].load(Relaxed),
+        UNTRANSLATED.load(Relaxed),
+    )
+}
+
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
 /// the library's file (kept whole while the library lives) and what its
@@ -171,12 +191,15 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        UNTRANSLATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        )
+                    }
                 }
                 done.ok()
             })
