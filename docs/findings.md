@@ -100,6 +100,13 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 | 2026-11-25 | [fxceless #994](https://github.com/fxceless/victory-fork/pull/994#issuecomment-7169362576) | builder runs 11 min on Win10/5060 Ti without CBV cap, but darker and GPU 172->272 ms |
 | 2026-11-27 | [fxceless #1319](https://github.com/fxceless/victory-fork/issues/1319#issuecomment-7203797939) | To Proudnoob4 (issues off on his repo): nvidia-hybrid-v2 no trees on NVIDIA = Batch 7 klbf#50 lds::meetings; bisect table; fix 2ce00838 (VICTORY_LDS_LEGACY fallback); warm tooling; open: dock black rectangles, glossy frost |
 
+## News scan 2026-11-27 (what matters for us)
+- fxceless #1379 (RTX 5080, trustno1 033be27f + avm speed wave + avm PRs 24/42/82/96/97/105/107/108/109/114/119 + fx 907/1044/1210, i.e. close to fork-hybrid): 12.9 -> ~25 fps. Steps: WC write-backs >=1 MiB not fetched back (fx#868 with 1 MiB min = hybrid f3c8a1f3 SKIP_WC_BACK/SKIP_WC_MIN_KB); CARD_BUFFERS_MIN_KB=64 (card wait 38 -> 16 ms, biggest step); RELAY=2 + CARD_STEPS=1 + TEXTURE_NO_WAIT=0 (CARD_STEPS=2 / NO_WAIT=1 gave noise faces); skip list as HashSet (hybrid already has it). Note: alternate A/B/A after re-translation, the driver cache needs ~5 runs to settle. -> run H10 with these.
+- avm PR #354: sparkling glass = NaN from killed lanes of a live quad (s_wqm); fixed in structure.rs. Not tested on NVIDIA; maybe related to our sparkles (not the frost).
+- trustno1 merged: Agility for Win10 (#10), mimalloc (+2 fps on 4090, #11), mouse camera (#9).
+- Marvisak #3386 BC7 mode 4/5 fix; #3352 NaN in float min/max; fx #310 black mosaic from opt passes (our H2 opt=63 still had dock blocks, so probably not ours).
+- No reply yet to our #1319 tree post.
+
 ## TODO
 - Check Marvisak/VIctory#2146's CopyResource fix (copies between formats of one DXGI family, e.g. R8G8B8A8_UNORM -> _SRGB, were dropped) in fork-fast and fork-cgbj-test1: a dropped copy leaves a texture empty/stale (flicker/missing objects?). Also its adapter pick by HIGH_PERFORMANCE (laptops). From antikohza's note on fxceless #22.
 - In-game stats panel like "Kitty Runtime" (user screenshot, 2026-11-25): title + big fps, then a row FRAME / GPU WAIT / CPU PREP / COPY-BACK in ms, then draws/frame, dropped/frame, RAM. Base: `crates/victory-gpu/src/fpsbox.rs` (fxceless ca8829ff, fps drawn into the top-left corner, `VICTORY_FPS_COUNTER=0` off). The numbers already exist in the frame line (host.rs "fps, ms/frame (preparing ...; on the GPU; copying back ...)"). Make it a small dark panel with labels; switch to toggle.
