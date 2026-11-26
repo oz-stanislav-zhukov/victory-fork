@@ -625,6 +625,29 @@ pub fn emit(
                 }
             }
         }
+        // Last of all, with the wave-wide form not asked for: a program that no other form
+        // takes off 64-lane waves is refused by a 32-lane host, and its dispatches are
+        // dropped (`sr_tracing:CS_Tiling_Generate_Opaque` and `GpuParticleUpdate:CS_Visibility`
+        // on an RTX 5060 Ti). The wave-wide form is exact and makes a pipeline for those two,
+        // so it is tried here, where the only other outcome is the pass not running at all.
+        // The programs that lost a card with it had another form and never reach this point.
+        // `VICTORY_WAVE_WIDE=0` leaves them refused, as before.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") {
+            let deep = form(ir::without_skips(p, true));
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (last resort)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
