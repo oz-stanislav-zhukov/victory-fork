@@ -122,6 +122,13 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 - Free to test in hybrid: VIEW_BYTES=0 (fx#1379: view_home -> shadow::exact mutex 37% of recording on avm main), SUBMIT_FRAMES=2 (avm#379: 179 -> 164 ms), LAND_ASIDE=1 (fx#1146).
 - Need porting (conflict on cherry-pick): fx#1224 FILL_HOT / BURY_ASIDE (SHADOW_CACHE overlaps QUICK_FIND); Marvisak#3184 DEFER_LISTS (+719, other tree); Marvisak#3405/#3258/#3274/#3275 lock-free per-draw texture/view reads; DexNom#27 per-command draw state lock; fx#1117 lock-free mirror + zero-copy windows; fx#1316 table CBV snapshot reuse.
 
+## Ports for recording (branch fork-hybrid-rec, worktree F:\Workf-bisect, 2026-11-27)
+- e76b45f9 DexNom#27: no lock per draw-state call (always on).
+- afefee47 VICTORY_BURY_ASIDE=1: buried objects dropped on their own thread (idea of fx#1224; hybrid's bury already 16-sharded prefix drain). FILL_HOT not portable: hybrid has no fill_ahead mechanism.
+- 95b1d9c0 Marvisak#3275: views looked up without the registry lock via per-thread memo + live generations (VICTORY_SEEN_VIEWS=0 off).
+- Not ported (yet): Marvisak#3258/#3405 (texture host-copy reads), fx#1117, Marvisak#3184 DEFER_LISTS - wait for H15 numbers first.
+- Open visual problems seen in H14: shadows appear/disappear with camera angle (cascade caster culling? check the 11 refused pipelines), black round blots on asphalt, arms/shirt black in shadows.
+
 ## TODO
 - Check Marvisak/VIctory#2146's CopyResource fix (copies between formats of one DXGI family, e.g. R8G8B8A8_UNORM -> _SRGB, were dropped) in fork-fast and fork-cgbj-test1: a dropped copy leaves a texture empty/stale (flicker/missing objects?). Also its adapter pick by HIGH_PERFORMANCE (laptops). From antikohza's note on fxceless #22.
 - In-game stats panel like "Kitty Runtime" (user screenshot, 2026-11-25): title + big fps, then a row FRAME / GPU WAIT / CPU PREP / COPY-BACK in ms, then draws/frame, dropped/frame, RAM. Base: `crates/victory-gpu/src/fpsbox.rs` (fxceless ca8829ff, fps drawn into the top-left corner, `VICTORY_FPS_COUNTER=0` off). The numbers already exist in the frame line (host.rs "fps, ms/frame (preparing ...; on the GPU; copying back ...)"). Make it a small dark panel with labels; switch to toggle.
