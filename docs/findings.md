@@ -14,6 +14,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
+| H14-rec | fork-hybrid 498dd68b | H12 + VIEW_BYTES=0 + SUBMIT_FRAMES=2 + LAND_ASIDE=1 | median 14.1 (H12 13.9) at ~6.1k draws | - | No gain; submission lock wait 16.8 -> 21.9 ms, guard lock waits 52 -> 66 ms (SUBMIT_FRAMES=2 adds contention: dropped). Shadows pop with camera angle; black blots on asphalt | levers do nothing; bottleneck = guard faults (468-590 write faults a frame, ~5 us protection change each, serialized) -> H16 COPY_BESIDE/STORE_BESIDE |
 | H13-noMINKB | fork-hybrid 498dd68b | H12 without CARD_BUFFERS_MIN_KB=64 | - | - | Arms / tank top still flicker, ONLY in shadows; dark smudges at the bottom of the shorts -> not MIN_KB (keep it). Likely the character's self-shadow (same as the H6 dock shirt blocks, before any speed switch) -> suspect cascade shadows on wave32 (av#82 area) | MIN_KB=64 stays |
 | H12-noRT | fork-hybrid 498dd68b | H10 set without -RayTracing | 14.6 at 6.8k draws (H10: 12.9 at 7.1k) | 69 | RT costs ~10-15% -> keep RT off. Tank top still flickers black -> flicker is in the H10 set, not the H11 extras (suspect CARD_BUFFERS_MIN_KB=64) | next H13 without MIN_KB |
 | H11 | fork-hybrid 498dd68b | H10 + CARD_BUFFERS_MB=2048 + FETCH_CHECK=1 (fx#1268 pass 13) | same as H10 (dock 9.9, 7k draws 12-15, indoors 22-24) | 41-108 | No gain. Arms / tank top / shorts flicker black at times (not in H10) -> drop both | rejected |
