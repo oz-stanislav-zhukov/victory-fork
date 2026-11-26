@@ -487,6 +487,19 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    // A pixel program whose killed lanes, going on with their live quad
+    // (`structure`, avatarmanz/VIctory-7900XTX#354), reach a lane test of a
+    // constant mask the lowering cannot make is translated once more with them
+    // leaving at the kill, as before: 13 of the title's programs.
+    match translate_halves(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSTANT_MASK => {
+            crate::structure::without_live_quads(|| translate_halves(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_halves(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
