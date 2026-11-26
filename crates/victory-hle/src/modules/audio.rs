@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -130,8 +131,51 @@ fn heap_free(ptr: *mut u8) {
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
     drop(heap);
-    // SAFETY: allocated by `heap_alloc` with this layout.
-    unsafe { std::alloc::dealloc(ptr, block.layout) };
+    // A title that frees a ring or an input of a voice still decoding (its
+    // bug, which corrupts memory on the console too) must not have the
+    // decoder write into freed host memory: the device range is given back
+    // now, the host memory once no slice of the heap is held.
+    let mut freed = lock(&FREED);
+    if HOLDING.load(Ordering::SeqCst) == 0 {
+        // SAFETY: allocated by `heap_alloc` with this layout.
+        unsafe { std::alloc::dealloc(ptr, block.layout) };
+    } else {
+        freed.push((ptr as usize, block.layout));
+    }
+}
+
+/// Threads holding slices of the heap ([`heap_bytes`]): a block freed
+/// meanwhile is let go by the last of them ([`Holding`]).
+static HOLDING: AtomicUsize = AtomicUsize::new(0);
+/// Blocks freed while slices were held: host address and layout.
+static FREED: Mutex<Vec<(usize, Layout)>> = Mutex::new(Vec::new());
+
+/// Held while slices of the heap are: a block freed meanwhile is gone from
+/// the heap at once (so no new slice reaches it) and let go after.
+struct Holding;
+
+impl Holding {
+    fn new() -> Holding {
+        HOLDING.fetch_add(1, Ordering::SeqCst);
+        Holding
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        if HOLDING.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        // Looked at again under the lock frees push under: one that began
+        // holding since may have a slice of a block freed after it began.
+        let mut freed = lock(&FREED);
+        if HOLDING.load(Ordering::SeqCst) == 0 {
+            for (ptr, layout) in freed.drain(..) {
+                // SAFETY: allocated by `heap_alloc` with this layout.
+                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            }
+        }
+    }
 }
 
 /// Sizes the heap once, before anything is allocated from it. The console
@@ -179,7 +223,8 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
 }
 
 /// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
+/// them all. Used only while a [`Holding`] is: the block stays in memory if
+/// the title frees it meanwhile.
 fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
@@ -494,6 +539,7 @@ impl Xma {
 
     /// Fills every enabled context's output as far as it has room.
     fn pump(&self) {
+        let _holding = Holding::new();
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
@@ -655,6 +701,7 @@ fn dump_input(index: u32, context: Context) {
     }
     let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
+    let _holding = Holding::new();
     let input = heap_bytes(
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
@@ -1408,5 +1455,26 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// A block freed while a slice of it is held (the decoder mid-pass) leaves
+    /// the heap at once but stays in memory until the slice is let go.
+    #[test]
+    fn a_block_freed_under_a_held_slice_stays_until_let_go() {
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x100, 128, 1), S_OK);
+        let at = ptr as usize;
+        let held = Holding::new();
+        let bytes = heap_bytes(apu, 0x100).expect("a live block");
+        ApuFree(ptr);
+        // Gone from the heap, so no new slice reaches it. (Its device range is
+        // given back at once: another test may hold it already.)
+        assert!(!lock(&HEAP).blocks.contains_key(&at));
+        // Still ours to write: kept until the last holder lets go.
+        assert!(lock(&FREED).iter().any(|&(p, _)| p == at));
+        bytes.fill(0x5a);
+        drop(held);
+        // Let go now, unless another test's pass holds slices still.
+        assert!(HOLDING.load(Ordering::SeqCst) > 0 || !lock(&FREED).iter().any(|&(p, _)| p == at));
     }
 }
