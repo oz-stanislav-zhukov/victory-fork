@@ -14,6 +14,7 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 ## Runs (newest first)
 | Run | Branch | Change vs previous | fps (world) | ms/frame | Picture | Verdict |
 |---|---|---|---|---|---|---|
+| H13-noMINKB | fork-hybrid 498dd68b | H12 without CARD_BUFFERS_MIN_KB=64 | - | - | Arms / tank top still flicker, ONLY in shadows; dark smudges at the bottom of the shorts -> not MIN_KB (keep it). Likely the character's self-shadow (same as the H6 dock shirt blocks, before any speed switch) -> suspect cascade shadows on wave32 (av#82 area) | MIN_KB=64 stays |
 | H12-noRT | fork-hybrid 498dd68b | H10 set without -RayTracing | 14.6 at 6.8k draws (H10: 12.9 at 7.1k) | 69 | RT costs ~10-15% -> keep RT off. Tank top still flickers black -> flicker is in the H10 set, not the H11 extras (suspect CARD_BUFFERS_MIN_KB=64) | next H13 without MIN_KB |
 | H11 | fork-hybrid 498dd68b | H10 + CARD_BUFFERS_MB=2048 + FETCH_CHECK=1 (fx#1268 pass 13) | same as H10 (dock 9.9, 7k draws 12-15, indoors 22-24) | 41-108 | No gain. Arms / tank top / shorts flicker black at times (not in H10) -> drop both | rejected |
 | H10-RT-fast | fork-hybrid 498dd68b | H9 + fx#1379 recipe: RELAY=2 CARD_STEPS=1 TEXTURE_NO_WAIT=0 CARD_BUFFERS_MIN_KB=64 SKIP_WC_BACK=1 | 10 (11.4k draws, dock), 13-17 indoors (3-5k), 20-21 (2-2.4k) | 46-98 (waits for GPU 4-6 ms, was 40-60) | Faster everywhere (+25-75%). No black flashes / face noise seen in shots. Indoor frost at noon as strong as ever (RT on) -> frost = sun through windows, time-of-day dependent | NEW BASE: keep these switches |
