@@ -10,6 +10,7 @@
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cell::UnsafeCell;
 use std::mem::offset_of;
 
 use crate::object::{
@@ -121,7 +122,9 @@ struct List {
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
-    state: std::sync::Mutex<crate::draw::State>,
+    /// Draw state is used by the title's calls on one thread at a time, like
+    /// `host`; recording does not need a lock per command (DexNom/VIctory#27).
+    state: UnsafeCell<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
     /// list is cut at its waits for memory values ([`cut`]).
     #[cfg(windows)]
@@ -154,8 +157,10 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the title passes one of our lists.
-    let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    // SAFETY: the title passes one of our lists and calls it on one thread at
+    // a time, so no other call is borrowing this state.
+    let state = unsafe { &mut *(*this.cast::<List>()).state.get() };
+    f(list, state);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -172,7 +177,8 @@ pub(crate) fn tables_done(lists: &[This]) {
         // SAFETY: the title passes our lists.
         let list = unsafe { &*this.cast::<List>() };
         if list.earlier.is_empty() {
-            list.state.lock().unwrap_or_else(|e| e.into_inner()).tables_done();
+            // SAFETY: the title calls a list on one thread at a time.
+            unsafe { &mut *list.state.get() }.tables_done();
         }
     }
 }
@@ -345,10 +351,8 @@ fn cut(this: This, wait: ValueWait) {
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
-        list.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replay(host);
+        // SAFETY: the title calls a list on one thread at a time.
+            unsafe { &mut *list.state.get() }.replay(host);
     }
 }
 
@@ -418,7 +422,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let state = std::mem::take(unsafe { &mut *list.state.get() });
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -491,7 +495,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
+                std::mem::take(&mut *(*list).state.get());
             (host, uploads, state)
         };
         order.push(taken.len());
@@ -617,7 +621,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         state: {
             let mut state = crate::draw::State::default();
             state.set_pipeline(pipeline);
-            std::sync::Mutex::new(state)
+            UnsafeCell::new(state)
         },
         #[cfg(windows)]
         earlier: Vec::new(),
@@ -2441,10 +2445,8 @@ fn value_written(this: This, address: u64, value: u64) {
             list.earlier.push(Part { waits, host: done });
         }
         if let Some(host) = list.host.as_ref() {
-            list.state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .replay(host);
+            // SAFETY: the title calls a list on one thread at a time.
+            unsafe { &mut *list.state.get() }.replay(host);
         }
     }
     #[cfg(not(windows))]
