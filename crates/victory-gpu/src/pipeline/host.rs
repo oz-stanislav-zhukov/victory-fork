@@ -703,6 +703,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    super::REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -862,7 +863,8 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                super::REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
