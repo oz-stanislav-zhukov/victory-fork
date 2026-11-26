@@ -111,6 +111,16 @@ VICTORY_BVH_BUILDER=0 (unless noted)
 - Marvisak #3386 BC7 mode 4/5 fix; #3352 NaN in float min/max; fx #310 black mosaic from opt passes (our H2 opt=63 still had dock blocks, so probably not ours).
 - No reply yet to our #1319 tree post.
 
+## Recording / CPU side (2026-11-27, H12 log at 16.3 fps, 61 ms frame, 5.7k draws)
+- List calls: 41,935 a frame, 188 ms over 8 threads (~24 ms each) = 4.5 us a call (fx#1379: 2.9 us).
+- Submitting thread: 22.6 ms user + 4.8 kernel inside submissions, **21.5 ms waiting for the submission lock**.
+- Write trackers' guard lock: 682 waits, **57 ms a frame** (all threads).
+- Watches: 416 a frame, 21 ms, 10.2 GB checked of which 10.16 GB unchanged; the title's 174 MB heap (0x194a0000+0xae00000) refreshed 11.5x a frame = 2.1 GB, 5 ms.
+- After a present 25.7 ms until the title's first list call (title CPU / its own waits).
+- Already in hybrid (do not port): fx#1237 per-thread lookup memo = QUICK_FIND/FOUND/FOUND_LOOSE; Marvisak#2821 RwLocks (SHADER_HEAPS, BUFFERS); avm#372 skip set.
+- Free to test in hybrid: VIEW_BYTES=0 (fx#1379: view_home -> shadow::exact mutex 37% of recording on avm main), SUBMIT_FRAMES=2 (avm#379: 179 -> 164 ms), LAND_ASIDE=1 (fx#1146).
+- Need porting (conflict on cherry-pick): fx#1224 FILL_HOT / BURY_ASIDE (SHADOW_CACHE overlaps QUICK_FIND); Marvisak#3184 DEFER_LISTS (+719, other tree); Marvisak#3405/#3258/#3274/#3275 lock-free per-draw texture/view reads; DexNom#27 per-command draw state lock; fx#1117 lock-free mirror + zero-copy windows; fx#1316 table CBV snapshot reuse.
+
 ## TODO
 - Check Marvisak/VIctory#2146's CopyResource fix (copies between formats of one DXGI family, e.g. R8G8B8A8_UNORM -> _SRGB, were dropped) in fork-fast and fork-cgbj-test1: a dropped copy leaves a texture empty/stale (flicker/missing objects?). Also its adapter pick by HIGH_PERFORMANCE (laptops). From antikohza's note on fxceless #22.
 - In-game stats panel like "Kitty Runtime" (user screenshot, 2026-11-25): title + big fps, then a row FRAME / GPU WAIT / CPU PREP / COPY-BACK in ms, then draws/frame, dropped/frame, RAM. Base: `crates/victory-gpu/src/fpsbox.rs` (fxceless ca8829ff, fps drawn into the top-left corner, `VICTORY_FPS_COUNTER=0` off). The numbers already exist in the frame line (host.rs "fps, ms/frame (preparing ...; on the GPU; copying back ...)"). Make it a small dark panel with labels; switch to toggle.
