@@ -27,7 +27,8 @@ param(
     [switch]$Warm,
     [switch]$WarmAll,
     [string[]]$WarmArgs = @(),
-    [string]$VictoryExe
+    [string]$VictoryExe,
+    [string]$Label
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -86,6 +87,7 @@ if ($Resolution) {
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($Label) { $settings.VICTORY_RUN_LABEL = $Label }   # shown in the window text
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
 Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
 
