@@ -1139,6 +1139,7 @@ impl Views {
                     self.by_resource.entry(r).or_default().push(i);
                 }
                 self.index.insert(view, i);
+                set_live(i, self.list[i as usize].1);
                 i
             }
         };
@@ -1370,6 +1371,7 @@ pub(crate) fn forget(resource: usize) {
         }
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
+        set_live(i, 0);
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
@@ -1377,15 +1379,94 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Entries of [`LIVE`]: chunks of this many, made as the view list grows.
+const LIVE_CHUNK: usize = 4096;
+
+/// The generation of each entry of [`VIEWS`] that a view holds (0: free, or not
+/// made yet), read without its lock, written under its exclusive lock. While an
+/// entry is live its view does not change (it gets another view only after
+/// [`forget`] freed it under a new generation), so a view a thread found for an
+/// entry and generation still live is the one there. (Port of
+/// Marvisak/VIctory#3275.) Entries past `LIVE_CHUNK * 1024` always take the lock.
+static LIVE: [std::sync::atomic::AtomicPtr<[std::sync::atomic::AtomicU32; LIVE_CHUNK]>; 1024] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1024];
+
+/// Entry `i`'s live generation, if its chunk is made.
+fn live(i: u32) -> Option<u32> {
+    use std::sync::atomic::Ordering::Acquire;
+    let chunk = LIVE.get(i as usize / LIVE_CHUNK)?.load(Acquire);
+    // SAFETY: chunks are never freed once made.
+    (!chunk.is_null()).then(|| unsafe { &(*chunk)[i as usize % LIVE_CHUNK] }.load(Acquire))
+}
+
+/// Entry `i` holds a view under `generation` (0: none). Called under [`VIEWS`]'
+/// exclusive lock.
+fn set_live(i: u32, generation: u32) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let Some(at) = LIVE.get(i as usize / LIVE_CHUNK) else {
+        return;
+    };
+    let mut chunk = at.load(Acquire);
+    if chunk.is_null() {
+        chunk = Box::into_raw(Box::new([const { std::sync::atomic::AtomicU32::new(0) }; LIVE_CHUNK]));
+        at.store(chunk, Release);
+    }
+    // SAFETY: as in `live`.
+    unsafe { &(*chunk)[i as usize % LIVE_CHUNK] }.store(generation, Release);
+}
+
+/// Views each thread looked up lately (entry, generation, view), by entry: the
+/// title's recording threads find the views their tables hold here, not under
+/// [`VIEWS`]' lock (`VICTORY_SEEN_VIEWS=0`: always under it).
+const SEEN_SLOTS: usize = 1024;
+type Seen = Vec<Option<(u32, u32, View)>>;
+std::thread_local! {
+    static SEEN: std::cell::RefCell<Seen> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn seen_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEEN_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// The view of entry `i` if `generation` is still its own.
+fn view_of(i: u32, generation: u32) -> Option<View> {
+    let quick = seen_views();
+    let slot = i as usize % SEEN_SLOTS;
+    if quick
+        && live(i) == Some(generation)
+        && let Ok(Some(view)) = SEEN.try_with(|s| match s.borrow().get(slot) {
+            Some(Some((at, g, view))) if *at == i && *g == generation => Some(view.clone()),
+            _ => None,
+        })
+    {
+        return Some(view);
+    }
+    let views = views_read();
+    let (view, current) = views.list.get(i as usize)?;
+    if *current != generation {
+        return None;
+    }
+    let view = view.clone();
+    drop(views);
+    // Kept only while the entry holds it.
+    if quick && live(i) == Some(generation) {
+        let _ = SEEN.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.is_empty() {
+                s.resize(SEEN_SLOTS, None);
+            }
+            s[slot] = Some((i, generation, view.clone()));
+        });
+    }
+    Some(view)
+}
+
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
+        0 => view_of(i, generation),
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
