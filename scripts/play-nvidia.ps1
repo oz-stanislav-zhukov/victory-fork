@@ -25,7 +25,8 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$Warm,
-    [switch]$WarmAll
+    [switch]$WarmAll,
+    [string[]]$WarmArgs = @()
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -107,6 +108,6 @@ $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 # -Warm: no title; the host pipelines of earlier runs (VICTORY_PIPELINE_BOOK=1) are made ahead, with the
 # same settings as the run, so the driver's cache has them (-WarmAll: every pipeline the title created).
-if ($Warm -or $WarmAll) { $runArgs = @('warm'); if (-not $WarmAll) { $runArgs += '--used' } }
+if ($Warm -or $WarmAll) { $runArgs = @('warm'); if (-not $WarmAll) { $runArgs += '--used' }; $runArgs += $WarmArgs }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }
