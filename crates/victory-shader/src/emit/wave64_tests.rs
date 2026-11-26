@@ -980,6 +980,7 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
 /// of `0 - x` on group-shared memory into a subtraction DXIL does not have, and NVIDIA's
 /// driver and WARP then refuse the pipeline (E_OUTOFMEMORY; compute 7f61193d2c0e5f22). The
 /// lowering makes it a compare-exchange loop instead. 32 threads each take 1 from 64.
+#[cfg(any())] // needs lowered_for_width (DexNom tree), not in this tree
 #[test]
 fn an_lds_addition_of_a_negated_value_is_a_compare_exchange_loop() {
     for (atomic, name) in [(0xD800_0000u32, "ds_add_u32 of 0 - 1"), (0xD804_0000, "ds_sub_u32 of 0 - 1 (adds)")] {
