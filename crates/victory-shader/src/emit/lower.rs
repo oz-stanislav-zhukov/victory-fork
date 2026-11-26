@@ -1130,8 +1130,93 @@ fn lds_meetings(
     cs: crate::native::ComputeIo,
     all: &[bool],
 ) -> Option<Vec<(bool, bool)>> {
-    super::lds::meetings(p, st, io, res, cs, all)
+    // The klbf#50 analysis is stricter than the check it replaced: it refuses regions with
+    // `ds_append`/`ds_consume`, barriers or shared write-only stores, which the title's culling
+    // programs (tree 55679a0547649d0b, tree_imposter 89d08e561897d4e5) have. Refused, those keep
+    // 64-lane waves and the NVIDIA driver refuses their pipelines (no trees). Where it refuses, the
+    // earlier check is asked (`VICTORY_LDS_LEGACY=0`: not), which is what trees drew with before.
+    super::lds::meetings(p, st, io, res, cs, all).or_else(|| lds_legacy().then(|| lds_meetings_legacy(p, st, all)).flatten())
 }
+
+/// Whether the check before klbf#50 is asked where the analysis refuses ([`lds_meetings`]); on
+/// unless `VICTORY_LDS_LEGACY=0`.
+fn lds_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_LEGACY").is_none_or(|v| v != "0"))
+}
+
+/// The check before klbf#50 (fork-nv, hybrid batches up to 6).
+fn lds_meetings_legacy(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    // regions: blocks not every lane runs, joined by the edges between them
+    let mut region: Vec<usize> = (0..n).collect();
+    fn find(region: &mut [usize], mut b: usize) -> usize {
+        while region[b] != b {
+            region[b] = region[region[b]];
+            b = region[b];
+        }
+        b
+    }
+    for b in 0..n {
+        for t in succ(b) {
+            if !all[b] && !all[t] {
+                let (x, y) = (find(&mut region, b), find(&mut region, t));
+                region[x] = y;
+            }
+        }
+    }
+    // per region: LDS reads, LDS writes
+    let mut reads = vec![false; n];
+    let mut writes = vec![false; n];
+    for (b, block) in p.blocks.iter().enumerate().take(n) {
+        if all[b] {
+            continue;
+        }
+        let r = find(&mut region, b);
+        for i in &block.insts {
+            let name = i.name();
+            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+                continue;
+            }
+            if name.starts_with("ds_read") {
+                reads[r] = true;
+            } else {
+                writes[r] = true;
+            }
+        }
+    }
+    // A region that reads and writes LDS is still taken when it only raises flags
+    // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
+    // the region leaves behind.
+    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if !(flags_on && lds_flag_region(p, st, &blocks)) {
+            return None;
+        }
+    }
+    let mut meet = vec![(false, false); n];
+    for b in 0..n {
+        for t in succ(b) {
+            if all[b] && !all[t] {
+                let r = find(&mut region, t);
+                meet[b].1 |= reads[r] || writes[r];
+            } else if !all[b] && all[t] {
+                let r = find(&mut region, b);
+                meet[t].0 |= reads[r] || writes[r];
+            }
+        }
+    }
+    Some(meet)
+}
+
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
 /// LDS only raises flags, so that it may run as two host waves with group barriers at its
