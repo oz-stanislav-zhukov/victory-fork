@@ -75,6 +75,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
+    // Pipelines the host refused (no crash): the run's own refusals, by index.
+    let refused_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-refused.txt"))?);
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
             s.spawn(|| {
@@ -89,8 +91,23 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
-                                println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
+                            if !there {
+                                // Its index is what `--these` takes.
+                                println!("no host pipeline: {n} {}", keys[n]);
+                                let _ = writeln!(lock(&refused_out), "{fingerprint} {n} {}", keys[n]);
+                            }
+                            if count % 50 == 0 || count == all.len() {
+                                let secs = began.elapsed().as_secs_f64();
+                                let left = secs / count as f64 * (all.len() - count) as f64;
+                                println!(
+                                    "[{:5.1}%] {count} of {}  {:.0} s gone, ~{:.0} min left  ({} refused, {} crashed)",
+                                    count as f64 * 100.0 / all.len().max(1) as f64,
+                                    all.len(),
+                                    secs,
+                                    left / 60.0,
+                                    state.1,
+                                    state.2
+                                );
                             }
                             drop(state);
                             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
