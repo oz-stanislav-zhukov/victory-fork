@@ -503,7 +503,41 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
+        bury_done(done);
+    }
+}
+
+/// Drops what [`bury`] took out, on a thread of its own with
+/// `VICTORY_BURY_ASIDE=1` (off by default: here, as before). Dropping later is
+/// always allowed: these objects only waited for the card. In the tree this
+/// comes from (fxceless/victory-fork#1224, Steenax6) releasing them took 2 ms
+/// a frame of the landing thread.
+fn bury_done(done: Vec<(u64, Retired)>) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1")) {
         drop(done);
+        return;
+    }
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
     }
 }
 
