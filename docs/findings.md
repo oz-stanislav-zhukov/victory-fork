@@ -177,3 +177,9 @@ elease. Launch: powershell -File F:Workf-nvscriptsplay-X-1080p.ps1 -Exe F:gta6G
 - NEXT 3: stats panel (TODO), ambient counter threshold, Qwen reports 05b-09.
 - Qwen research loop keeps running (F:\Workictory-runlogs\qwen
 esearch, STOP file stops it).
+
+### PR scan 2026-11-27 (fx #994, #115, #917)
+- #994 (RT builder): HyperEndgame's 3-line fix (structure view address read as 0 in `draw.rs` user-data path) is already in our tree (`view_address` on the table path). HLVM04: #993+#994 builder on 5070 Ti = 70-77 ms, interiors better lit, but player skin draw missing. KyleS98: no-hit node tests fix pale hair / window haze / banded wall. drchef420: indoor scene "washed white with smeared streaks" (open, like our frost); black shaded surfaces not from the builder; boat needs `VICTORY_TEXTURE_BACK=1`.
+- #917 (AMBIENT): iGoldenNinja shows the title's own resolve holds real light up to 4.4 (12% of texels >= 0.6); the stand-in replaces it, so "raise to at least" is proposed. tippythetaidum: indoor sunglasses reflect blue sky = specular, not this pass -> candidate for our indoor frost (sky in indoor reflections). edde28c4 moves the pass onto Host (device lifetime).
+- #115 (texture guard views): integrated into fx main at 8dd30ab; two-consumer test passes. Nothing to port for us.
+- H16 user report: shorts get large black patches (not fixed by #354); shirt unclear.
