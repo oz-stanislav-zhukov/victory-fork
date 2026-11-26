@@ -319,7 +319,7 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
-        if !shown().load(Ordering::Relaxed) {
+        if !shown().load(Ordering::Relaxed) && !super::panel_window::asked() {
             self.frames = 0;
             return;
         }
@@ -343,6 +343,12 @@ impl Panel {
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
         self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
+        if super::panel_window::asked() {
+            let mut all = self.lines.clone();
+            all.pop(); // "THIS PANEL": the picture's box only
+            all.extend(crate::pipeline::stat_lines());
+            super::panel_window::set(&all);
+        }
         self.changed = true;
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
