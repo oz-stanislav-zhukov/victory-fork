@@ -10213,7 +10213,8 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(
-            " | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame drop {dropped:.0}{}",
+            " | VIctory{} {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame drop {dropped:.0}{}",
+            run_label(),
             crate::pipeline::caption()
         );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
@@ -11924,3 +11925,12 @@ mod refresh_once_tests {
     }
 }
 
+
+/// The run's name for the window text (`VICTORY_RUN_LABEL`, e.g. `H7`): which run a screenshot is of.
+fn run_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| match std::env::var("VICTORY_RUN_LABEL") {
+        Ok(l) if !l.trim().is_empty() => format!(" [{}]", l.trim()),
+        _ => String::new(),
+    })
+}
