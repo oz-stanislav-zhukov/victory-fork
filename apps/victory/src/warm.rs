@@ -46,6 +46,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             done.insert(key);
         }
     }
+    if done.is_empty() || again {
+        // LOCAL: libraries of another translator or driver are no use to the runs.
+        let _ = std::fs::remove_dir_all(dir.join(known::WARM_FOLDER));
+    }
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
@@ -210,6 +214,8 @@ fn make(dir: &Path, these: &str) -> Result<()> {
     let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
+    // LOCAL: kept in a library of this process's own, which the runs look in.
+    known::use_warm_library(dir.join(known::WARM_FOLDER).join(format!("{}-{}", std::process::id(), these[0])));
     let mut out = std::io::stdout();
     known::make(dir, &these, |n, came| {
         let told = match came {
@@ -221,7 +227,8 @@ fn make(dir: &Path, these: &str) -> Result<()> {
             std::process::exit(1);
         }
     });
-    // Without what a run's end does (nothing to save, the host's threads).
+    // Without what a run's end does (the host's threads), but its library.
+    known::save_warmed();
     let _ = out.flush();
     std::process::exit(0)
 }

@@ -208,6 +208,21 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// LOCAL: the folder under the pipeline folder where `victory warm`'s
+/// processes keep the libraries they fill (each in one of its own).
+pub const WARM_FOLDER: &str = super::library::WARM_FOLDER;
+
+/// LOCAL: what this `victory warm` process makes is kept in a library in
+/// `dir` too, which the runs look in ([`save_warmed`] writes it).
+pub fn use_warm_library(dir: PathBuf) {
+    super::library::use_warm_library(dir);
+}
+
+/// LOCAL: writes this `victory warm` process's library.
+pub fn save_warmed() {
+    super::library::save_warmed();
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {

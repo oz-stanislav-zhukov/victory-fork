@@ -67,6 +67,58 @@ pub(super) fn folder() -> Option<PathBuf> {
     DIR.get().cloned()
 }
 
+/// LOCAL: where `victory warm`'s processes keep the libraries they fill
+/// (one folder each under the pipeline folder): a run loads what it lacks
+/// from them and keeps it in its own library ([`warmed`]).
+pub const WARM_FOLDER: &str = "warm";
+
+/// LOCAL: a `victory warm` process keeps what it makes in a library of its
+/// own in `dir` (a folder under [`WARM_FOLDER`]) and writes it at its end
+/// ([`save_warmed`]).
+pub fn use_warm_library(dir: PathBuf) {
+    let _ = DIR.set(dir);
+}
+
+/// LOCAL: writes a `victory warm` process's library.
+pub fn save_warmed() {
+    save(true);
+}
+
+/// The libraries `victory warm` filled, loaded at the first lookup: a
+/// pipeline the run's own library lacks is looked for in them.
+fn warmed() -> &'static [Library] {
+    static WARMED: OnceLock<Vec<Library>> = OnceLock::new();
+    WARMED.get_or_init(|| {
+        let Some(dir) = DIR.get().map(|d| d.join(WARM_FOLDER)) else { return Vec::new() };
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        let (mut rejected, mut bytes) = (0usize, 0usize);
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let blob = Blob::of(&entry.path());
+            if blob.bytes().is_empty() {
+                continue;
+            }
+            // SAFETY: the bytes outlive the library (kept beside it).
+            match unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob.bytes()) }.and_then(|l| l.cast()) {
+                Ok(library) => {
+                    bytes += blob.bytes().len();
+                    all.push(Library { library, _blob: blob, added: AtomicU64::new(0), saving: RwLock::new(()) });
+                }
+                Err(_) => rejected += 1,
+            }
+        }
+        if !all.is_empty() || rejected > 0 {
+            tracing::info!(libraries = all.len(), rejected, bytes, "libraries victory warm filled are looked in for what this run's lacks");
+        }
+        all
+    })
+}
+
+/// Pipelines found in [`warmed`] since the start.
+pub(crate) static FROM_WARM: AtomicU64 = AtomicU64::new(0);
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
@@ -584,7 +636,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -620,6 +672,18 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    // LOCAL: made ahead by `victory warm`, kept in this run's library too.
+    if let Some(pso) = warmed().iter().find_map(|w| load(&w.library, PCWSTR(wide.as_ptr())).ok()) {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        FROM_WARM.fetch_add(1, Ordering::Relaxed);
+        let _all = one_call();
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live pipeline.
+        if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            library.added.fetch_add(1, Ordering::Relaxed);
+        }
+        return Ok(pso);
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
