@@ -208,7 +208,7 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
                 }
                 Patched::Done
             })();
-            let offset = format_args!("{:#x}", site.at);
+            let offset = format!("{:#x}", site.at);
             match done {
                 Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
                 Patched::Differs => tracing::warn!(site = %offset, "frame rate: not patched, the title's bytes there are not the ones expected (another build?)"),
