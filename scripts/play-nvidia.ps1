@@ -39,7 +39,9 @@ param(
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('release', 'diag')][string]$Build = 'release',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [string]$VictoryExe,
+    [string]$Label
 )
 $ErrorActionPreference = 'Stop'
 
@@ -169,8 +171,10 @@ if ($Resolution) {
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+if ($Label) { $settings.VICTORY_RUN_LABEL = $Label }   # shown in the window text
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if ($VictoryExe) { $victory = $VictoryExe }   # another build (bisecting)
 if (-not (Test-Path $victory)) {
     Write-Host "No $victory. Build it first: cargo build --release -p victory"
     return
