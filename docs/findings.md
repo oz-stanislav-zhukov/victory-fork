@@ -184,3 +184,10 @@ esearch, STOP file stops it).
 - #115 (texture guard views): integrated into fx main at 8dd30ab; two-consumer test passes. Nothing to port for us.
 - H16 user report: shorts get large black patches (not fixed by #354); shirt unclear.
 - H17 (`H17-pushka`: H16 build + AMBIENT=1, AMBIENT_REFLECT=1, no VIEW_BYTES/LAND_ASIDE): no global change. Reflect clamp never ran (no `CS_UpdateHistory` dispatched; hybrid's guessed name). Frost and glowing sunglasses (sky in indoor reflections, as in fx#917 tippythetaidum) unchanged. Shirt still flickers black -> not fixed by #354. H18 logs program names (`VICTORY_PROGRAM_NAMES=1`, local) to find the real reflection program.
+
+### News scan 2026-11-27 afternoon (~11 h)
+- **Proudnoob4 nvidia-hybrid-v2 head `a6231671`** (Pass 46-49): RTX 4080 Series S 540p 31-42 fps uncapped, locked 30 by default (precise pacer); our trees fix `2ce00838` merged upstream; reflections clamp on `CS_RayMiss` (`VICTORY_AMBIENT_SPECULAR=0.8,0.1`, from foxhound) = the real fix for our frost/glowing sunglasses (our `CS_UpdateHistory` guess never fired); `VICTORY_FILL_TITLE=1` +22% on Series X (one 15.9 ms settle per frame); `VICTORY_UNLOCK_FPS` patches the title's 30 fps floor. d0dev 4070 Ti S: 27.5-30 standing, 10-19 turning fast; clothes flicker + black "puddle" polygon still there.
+- **trustno1 main**: rebased on foxhound + CGBJ renderer, DLSS + DLSS-G frame generation 2x-6x (RTX 50: 4x), F1 menu, F3 stats; d0dev same PC: 24-26 real fps standing on the boat (Series X 1440 DLSS Q), ~50 shown with FG 2x.
+- fx #1451: `VICTORY_ASYNC_PRESENT=1` +9% when submit-bound (not in hybrid). fx #1459/#1461: NVIDIA picture depends on static sampler order in the pipeline library (wrong shadows/hair) -> `VICTORY_SAMPLER_ORDER` fix in #1461; candidate for our camera-angle shadow popping.
+- PortWatch board: Belobug 91.3% leader, VIctory-NVIDIA 90%.
+- Our UI commits rebased onto `a6231671` as branch `fork-hybrid2` (worktree F:\Work\vf-h2).
