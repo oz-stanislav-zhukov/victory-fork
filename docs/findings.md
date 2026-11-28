@@ -216,7 +216,7 @@ esearch, STOP file stops it).
 | X Balanced, FG 2x, water off | 16.5 | 11.8 | 53-57 / ~80 | 44 |
 | X Performance + M, FAST_CORES=1 | 21.8 (2.4k draws) | 13.1 | 41 / 65 | 34-48 |
 | **S 720->1080 Quality + M** | **20.0** | **20.0** | 45-48 | 38-40 |
-- Series S: steady 20 fps both views, no clothing flicker (X: flicker, "no free dynamic descriptor slots" only there). Posted to nv#813 (two comments).
+- Series S: steady 20 fps both views. Clothing flickers on S too (my "no flicker on S" follow-up was wrong; user deleted it). First nv#813 comment stays.
 - 720 internal on X only took ~15 ms off GPU: most GPU work is resolution-independent.
 - P-cores 100%, E-cores ~20% under default FAST_CORES=2; =1 kept (no visible gain or loss).
 - Saves fixed by nv 879558a3 (os error 32 on old versions; something holds the files).
