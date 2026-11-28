@@ -453,7 +453,18 @@ fn take_from<B: Clone + 'static>(
     len: u64,
     align: u64,
     ripe: impl Fn() -> Ripe,
+    make: impl FnMut() -> Option<B>,
+) -> Option<(Piece, B, bool)> {
+    take_from_with(pool, len, align, ripe, make, None)
+}
+
+fn take_from_with<B: Clone + 'static>(
+    pool: &'static Mutex<Pool<B>>,
+    len: u64,
+    align: u64,
+    ripe: impl Fn() -> Ripe,
     mut make: impl FnMut() -> Option<B>,
+    on_none_empty: Option<fn()>,
 ) -> Option<(Piece, B, bool)> {
     let first = ripe();
     let mut p = lock(pool);
@@ -479,6 +490,8 @@ fn take_from<B: Clone + 'static>(
         p.making_ahead += 1;
     }
     let taken = p.taken(i, start, len, first);
+    let none_empty =
+        on_none_empty.is_some() && first.ahead == 0 && !p.blocks.iter().flatten().any(|b| b.free.whole(BLOCK));
     drop(p);
     if ahead {
         /// Counts the block as made (or not) even if `make` unwinds.
@@ -502,6 +515,8 @@ fn take_from<B: Clone + 'static>(
             }
             None => p.failed_growth(now()),
         }
+    } else if none_empty && let Some(f) = on_none_empty {
+        f();
     }
     taken
 }
@@ -890,6 +905,63 @@ fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
     }
 }
 
+/// A new block of texture memory, resident and mapped (waited for).
+fn make_texture_block(device: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: BLOCK,
+        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    // SAFETY: plain creation.
+    if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+        crate::residency::allocation_error(&e);
+        tracing::warn!(error = %e, "no block of texture memory");
+    }
+    if let Some(h) = &heap
+        && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+    {
+        tracing::warn!(error = %e, "a block of texture memory is not resident");
+        return None;
+    }
+    heap
+}
+
+/// Whether one empty block of textures is kept made by a thread of ours,
+/// for the next texture no block has room for (`VICTORY_BLOCK_AHEAD=0`:
+/// none, the thread that needs it makes it, as before).
+fn block_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLOCK_AHEAD").is_none_or(|v| v != "0"))
+}
+
+static MAKING_AHEAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MADE_AHEAD: AtomicU64 = AtomicU64::new(0);
+
+/// Makes one empty block of textures on a thread of ours ([`block_ahead`]),
+/// unless one is being made.
+fn make_one_ahead() {
+    if !block_ahead() || !crate::resource::room_lately() || MAKING_AHEAD.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let made = std::thread::Builder::new().name("victory-block-ahead".into()).spawn(|| {
+        if let Some(host) = crate::host::host()
+            && let Some(heap) = make_texture_block(&host.device)
+        {
+            let mut pool = lock(&TEXTURES);
+            if !pool.blocks.iter().flatten().any(|b| b.free.whole(BLOCK)) {
+                pool.add(heap, crate::host::submissions().0);
+                MADE_AHEAD.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        MAKING_AHEAD.store(false, Ordering::Release);
+    });
+    if made.is_err() {
+        MAKING_AHEAD.store(false, Ordering::Release);
+    }
+}
+
 /// A texture of `desc` (no target, depth or unordered access) in a block;
 /// `None`: not pooled, or the host refused.
 ///
@@ -931,27 +1003,7 @@ pub(crate) unsafe fn texture(
         0
     };
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = take_from(&TEXTURES, info.SizeInBytes, info.Alignment.max(1), Ripe::now, || {
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
-            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
-            Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
-        };
-        let mut heap: Option<ID3D12Heap> = None;
-        // SAFETY: plain creation.
-        if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
-            crate::residency::allocation_error(&e);
-            tracing::warn!(error = %e, "no block of texture memory");
-        }
-        if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
-        {
-            tracing::warn!(error = %e, "a block of texture memory is not resident");
-            return None;
-        }
-        heap
-    })?;
+    let (piece, heap, again) = take_from_with(&TEXTURES, info.SizeInBytes, info.Alignment.max(1), Ripe::now, || make_texture_block(device), Some(make_one_ahead))?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of
     // it is taken.
@@ -1307,5 +1359,44 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn an_empty_block_is_made_ahead_once_none_is_left() {
+        let Some(host) = crate::host::host() else { return };
+        if !block_ahead() || ahead() != 0 || !crate::resource::room_lately() {
+            return;
+        }
+        let made_before = MADE_AHEAD.load(Ordering::Relaxed);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2048,
+            Height: 2048,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let empty = || lock(&TEXTURES).blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+        let mut held = Vec::new();
+        for _ in 0..64 {
+            // SAFETY: a valid description.
+            held.extend(unsafe { texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) });
+            if empty() == 0 {
+                break;
+            }
+        }
+        let began = std::time::Instant::now();
+        while empty() == 0 && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(empty() >= 1, "no block was made ahead");
+        while MAKING_AHEAD.load(Ordering::Acquire) && began.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!MAKING_AHEAD.load(Ordering::Acquire), "the thread that makes it ahead did not end");
+        assert!(MADE_AHEAD.load(Ordering::Relaxed) > made_before, "the empty block is not one made ahead");
+        drop(held);
     }
 }
