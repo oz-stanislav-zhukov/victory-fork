@@ -218,6 +218,6 @@ esearch, STOP file stops it).
 | **S 720->1080 Quality + M** | **20.0** | **20.0** | 45-48 | 38-40 |
 - Series S: steady 20 fps both views. Clothing flickers on S too (my "no flicker on S" follow-up was wrong; user deleted it). First nv#813 comment stays.
 - 720 internal on X only took ~15 ms off GPU: most GPU work is resolution-independent.
-- P-cores 100%, E-cores ~20% under default FAST_CORES=2; =1 kept (no visible gain or loss).
+- P-cores 100%, E-cores ~20% under default FAST_CORES=2. NOTE: play.rs and play-foxhound.ps1 clear every VICTORY_* env var (except paths); switches set in a .cmd never reached the game. Put them in victory-settings.txt (the launcher reads any VICTORY_ line there). So FAST_CORES=1 / LATE_WAIT_LISTS=1024 were untested until run 133919.
 - Saves fixed by nv 879558a3 (os error 32 on old versions; something holds the files).
 - Overlay text: font::scale = height/400 (680b9212), readable in a 1000-line window.
