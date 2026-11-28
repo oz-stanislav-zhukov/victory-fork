@@ -2727,6 +2727,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Per-shadow coalesced span `(copies_index, from, to)` in the current
+    /// uninterrupted segment (cleared on title writes and per-shadow on GPU
+    /// writes): lets `VICTORY_THIN` workers merge overlapping/adjacent
+    /// refreshes before the submitting thread ever walks `copies`.
+    refreshed_span: std::collections::HashMap<usize, (usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Ranges declared written by shaders since the list last wrote title
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
@@ -2773,6 +2778,7 @@ impl Deferred {
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
+        self.refreshed_span.clear();
         self.gpu_written.clear();
         self.filled.clear();
     }
@@ -6903,6 +6909,7 @@ impl HostList {
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+        deferred.refreshed_span.clear();
     }
 
     /// A new host list for one of the title's lists (`crate::list::detach`),
@@ -7677,11 +7684,33 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let deferred = &mut *deferred;
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        let end = address.saturating_add(len);
+        if let Some(&mut (idx, ref mut from, ref mut to)) = deferred.refreshed_span.get_mut(&ptr)
+            && address <= *to
+            && end >= *from
+        {
+            if *from <= address && end <= *to {
+                return;
+            }
+            let new_from = (*from).min(address);
+            let new_to = (*to).max(end);
+            if let Some(Step::Refresh(_, a, l)) = deferred.copies.get_mut(idx) {
+                *a = new_from;
+                *l = new_to - new_from;
+                *from = new_from;
+                *to = new_to;
+                return;
+            }
+        }
+        let key = (ptr, address, len);
         if deferred.refreshed.insert(key) {
+            let idx = deferred.copies.len();
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.refreshed_span.insert(ptr, (idx, address, end));
         }
     }
 
@@ -7697,7 +7726,9 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        let ptr = std::sync::Arc::as_ptr(shadow) as usize;
+        deferred.refreshed_span.remove(&ptr);
+        let key = (ptr, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
@@ -8995,7 +9026,7 @@ impl Batch {
         let mut spans = spans;
         let dropped = Self::filter_nothing_new(&mut spans);
         FLUSHES[2].fetch_add(dropped as u64, Ordering::Relaxed);
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
@@ -9053,9 +9084,21 @@ impl Batch {
         }
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
+        crate::shadow::wide_chunks(due.len(), 32, move |range| {
+            let mut need = [0usize; 32];
+            let mut n_need = 0usize;
+            {
+                let journal = crate::watch::read_journal();
+                for i in range {
+                    let (shadow, from, to) = &due[i];
+                    if !shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        need[n_need] = i;
+                        n_need += 1;
+                    }
+                }
+            }
+            for &i in &need[..n_need] {
+                let (shadow, from, to) = &due[i];
                 Self::update(shadow, *from, *to);
             }
         });
@@ -9130,7 +9173,8 @@ impl Batch {
         const CHUNK: usize = 128;
         let all = items.len();
         if all <= FEW {
-            items.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let journal = crate::watch::read_journal();
+            items.retain(|(shadow, from, to)| !shadow.nothing_new_with(&journal, *from, *to - *from));
             return all - items.len();
         }
         let words = all.div_ceil(64);
@@ -9161,12 +9205,15 @@ impl Batch {
             let slice = unsafe { ptr.slice(start, end) };
             let mut mask0 = 0u64;
             let mut mask1 = 0u64;
-            for (offset, (shadow, from, to)) in slice.iter().enumerate() {
-                if !shadow.nothing_new(*from, *to - *from) {
-                    if offset < 64 {
-                        mask0 |= 1u64 << offset;
-                    } else {
-                        mask1 |= 1u64 << (offset - 64);
+            {
+                let journal = crate::watch::read_journal();
+                for (offset, (shadow, from, to)) in slice.iter().enumerate() {
+                    if !shadow.nothing_new_with(&journal, *from, *to - *from) {
+                        if offset < 64 {
+                            mask0 |= 1u64 << offset;
+                        } else {
+                            mask1 |= 1u64 << (offset - 64);
+                        }
                     }
                 }
             }
@@ -9202,7 +9249,7 @@ impl Batch {
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        let ahead = self.refreshes.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
