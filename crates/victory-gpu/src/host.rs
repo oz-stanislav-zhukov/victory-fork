@@ -497,7 +497,64 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+    // On a thread that batches (the list translators): kept here and handed
+    // over in one lock, not one lock a descriptor slot.
+    let object = match RETIRE_BATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        match b.as_mut() {
+            Some(batch) => {
+                batch.push((started, Retired::Resource(object)));
+                Ok(batch.len() >= RETIRE_BATCH_MAX)
+            }
+            None => Err(object),
+        }
+    }) {
+        Ok(full) => {
+            if full {
+                flush_retirements();
+            }
+            return;
+        }
+        Err(object) => object,
+    };
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+}
+
+/// How many retirements a batching thread keeps before it hands them over.
+const RETIRE_BATCH_MAX: usize = 256;
+
+thread_local! {
+    /// A list translator's resources let go and not yet handed to
+    /// [`RETIRED`] ([`batch_retirements`]). Each keeps the submission count
+    /// it was let go at, so handing it over later only drops it later.
+    static RETIRE_BATCH: std::cell::RefCell<Option<Vec<(u64, Retired)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The calling thread keeps the resources it retires and hands them over
+/// together ([`flush_retirements`], which it must call when a piece of work
+/// ends). The list translators: in run timeline profile-t1 (2026-11-28) 65%
+/// of their contended locks were [`RETIRED`]'s, one a descriptor slot made.
+/// `VICTORY_RETIRE_BATCH=0`: one lock each, as before.
+pub(crate) fn batch_retirements() {
+    if std::env::var("VICTORY_RETIRE_BATCH").is_ok_and(|v| v.trim() == "0") {
+        return;
+    }
+    RETIRE_BATCH.with(|b| *b.borrow_mut() = Some(Vec::with_capacity(RETIRE_BATCH_MAX)));
+}
+
+/// Hands what the calling thread kept ([`batch_retirements`]) to [`RETIRED`].
+pub(crate) fn flush_retirements() {
+    let taken = RETIRE_BATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        let batch = b.as_mut()?;
+        if batch.is_empty() {
+            return None;
+        }
+        Some(std::mem::replace(batch, Vec::with_capacity(RETIRE_BATCH_MAX)))
+    });
+    if let Some(taken) = taken {
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(taken);
+    }
 }
 
 /// How many submissions later than it could (the last one that may use it

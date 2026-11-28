@@ -3576,7 +3576,7 @@ impl HostHeap {
                 self.clear_twin(index);
             }
             self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, made.kept.as_ref());
             Some(made.listed)
         })
     }
@@ -3649,6 +3649,25 @@ impl HostHeap {
         };
         // A running submission may still read the old resource through
         // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::keep`] from a borrowed resource: cloned (a reference
+    /// count taken) only when the slot showed another.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        use windows::core::Interface;
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.cloned())
+        };
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }

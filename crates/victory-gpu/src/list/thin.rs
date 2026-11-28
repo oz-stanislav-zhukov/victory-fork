@@ -244,6 +244,7 @@ impl Recording {
             };
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            crate::host::flush_retirements();
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -305,6 +306,7 @@ fn start() {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
+            crate::host::batch_retirements();
             loop {
                 let recording = {
                     let mut ready = held(&READY);
