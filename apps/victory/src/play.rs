@@ -92,6 +92,10 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_POOL_SMALL", "0"),
     ("VICTORY_TABLED_REREAD", "1"),
     ("VICTORY_QUEUE_HOST_TEXTURES", "0"),
+    ("VICTORY_WAIT_RESIDENT", "textures"),
+    ("VICTORY_DUE_FRESH_FIRST", "1"),
+    ("VICTORY_TEXTURE_HASH_EVERY", "0"),
+    ("VICTORY_TEXTURE_HOT_FRAMES", "0"),
     // Descriptor heaps' records
     ("VICTORY_HEAP_SYNC_FIRST", "1"),
     ("VICTORY_SYNC_IN_PLACE", "1"),
