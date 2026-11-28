@@ -9127,35 +9127,63 @@ impl Batch {
     /// `ask_ahead` and `wide_each`, returning how many were dropped.
     fn filter_nothing_new(items: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> usize {
         const FEW: usize = 256;
-        const CHUNK: usize = 64;
+        const CHUNK: usize = 128;
         let all = items.len();
         if all <= FEW {
             items.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             return all - items.len();
         }
-        let taken = std::sync::Arc::new(std::mem::take(items));
+        let words = all.div_ceil(64);
         let keep = std::sync::Arc::new(
-            (0..all)
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
+            (0..words)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect::<Vec<_>>(),
         );
-        let (taken_ref, keep_ref) = (taken.clone(), keep.clone());
+        // SAFETY: `wide_each` joins all workers before returning, so `items`
+        // outlives every worker closure; each worker only reads `&items[idx]`.
+        struct ItemsPtr(*const (std::sync::Arc<crate::shadow::Shadow>, usize, usize), usize);
+        impl ItemsPtr {
+            fn len(&self) -> usize {
+                self.1
+            }
+            unsafe fn slice(&self, start: usize, end: usize) -> &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] {
+                unsafe { std::slice::from_raw_parts(self.0.add(start), end - start) }
+            }
+        }
+        unsafe impl Send for ItemsPtr {}
+        unsafe impl Sync for ItemsPtr {}
+        let ptr = ItemsPtr(items.as_ptr(), all);
+        let keep_ref = keep.clone();
         crate::shadow::wide_each(all.div_ceil(CHUNK), move |chunk| {
             let start = chunk * CHUNK;
-            let end = (start + CHUNK).min(taken_ref.len());
-            for idx in start..end {
-                let (shadow, from, to) = &taken_ref[idx];
+            let end = (start + CHUNK).min(ptr.len());
+            // SAFETY: `start..end` is within `0..all` and `items` is immutable for this scope.
+            let slice = unsafe { ptr.slice(start, end) };
+            let mut mask0 = 0u64;
+            let mut mask1 = 0u64;
+            for (offset, (shadow, from, to)) in slice.iter().enumerate() {
                 if !shadow.nothing_new(*from, *to - *from) {
-                    keep_ref[idx].store(true, Ordering::Relaxed);
+                    if offset < 64 {
+                        mask0 |= 1u64 << offset;
+                    } else {
+                        mask1 |= 1u64 << (offset - 64);
+                    }
                 }
             }
+            let word = chunk * 2;
+            if mask0 != 0 {
+                keep_ref[word].store(mask0, Ordering::Relaxed);
+            }
+            if mask1 != 0 {
+                keep_ref[word + 1].store(mask1, Ordering::Relaxed);
+            }
         });
-        let taken = std::sync::Arc::try_unwrap(taken).unwrap_or_else(|_| unreachable!());
-        *items = taken
-            .into_iter()
-            .zip(keep.iter())
-            .filter_map(|(item, k)| k.load(Ordering::Relaxed).then_some(item))
-            .collect();
+        let mut idx = 0usize;
+        items.retain(|_| {
+            let keep_item = (keep[idx >> 6].load(Ordering::Relaxed) & (1u64 << (idx & 63))) != 0;
+            idx += 1;
+            keep_item
+        });
         all - items.len()
     }
 
