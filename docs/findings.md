@@ -221,3 +221,14 @@ esearch, STOP file stops it).
 - P-cores 100%, E-cores ~20% under default FAST_CORES=2. NOTE: play.rs and play-foxhound.ps1 clear every VICTORY_* env var (except paths); switches set in a .cmd never reached the game. Put them in victory-settings.txt (the launcher reads any VICTORY_ line there). So FAST_CORES=1 / LATE_WAIT_LISTS=1024 were untested until run 133919.
 - Saves fixed by nv 879558a3 (os error 32 on old versions; something holds the files).
 - Overlay text: font::scale = height/400 (680b9212), readable in a 1000-line window.
+
+## Recording profile (diag, VICTORY_PROFILE 150-330 s, Series S street, 2026-11-28 13:39 run)
+Symbolizer: F:\Work\victory-runlogs\tools\symprof.py (+callees.py, callers.py) via DbgHelp + target\diag\victory.pdb.
+- victory-list-0..7 (THIN translators): **47% idle** (condvar, waiting for work). Busy part: execute_indirect 61% -> prepare_for -> State::bind
+  (make_listed tables 38% of bind: make_twinned/buffer_srv view creation, HostHeap::keep AddRef; readable 20%: buffer_copy, defer_refresh, texture alias).
+  Contended locks: **65% retire_resource (global RETIRED push per descriptor slot)**, HostHeap::dynamic 10%, texture_at 9%.
+- victory-submit: 32% waiting (Host::submit condvar 43%, shadow::wide 35%); shadow::wide_ranges 25%, Shadow::update 13%, watch::writes 12%;
+  contended: watch::guards 73%, retire_resource 21%. Vec::retain in settle<-relay_land 8%.
+- Fix 4fa0fe19 (fork-t1): list threads batch retirements thread-locally (flush per chunk / 256), keep_ref avoids AddRef when same. VICTORY_RETIRE_BATCH=0 off.
+- fork-t1-perf 9f8314d5 = fork-t1 + trustno1 PR #814 (texture refresh CPU cuts). Staged as target\release\victory.exe; fork-t1 alone saved as victory-t1-batch.exe. Untested in game.
+- Ideas not done (risky blind): keep make_listed views across recordings (cleared per recording now), skip bind for unchanged consecutive indirect calls.
