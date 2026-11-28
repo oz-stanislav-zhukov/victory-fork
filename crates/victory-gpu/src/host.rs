@@ -8958,35 +8958,29 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
-        const FEW: usize = 256;
+        // Filter out refreshes known to copy nothing before `ask_ahead` and
+        // `wide_each`, even when there are many (> FEW), so no-ops never
+        // trigger `ask_ahead` or worker scheduling overhead.
         let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
-            let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
-        }
+        let dropped = Self::filter_nothing_new(&mut spans);
+        FLUSHES[2].fetch_add(dropped as u64, Ordering::Relaxed);
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
-        });
+        if !spans.is_empty() || !due.is_empty() {
+            crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[i];
+                Self::update(shadow, *from, *to);
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9098,19 +9092,54 @@ impl Batch {
         FLUSHES[1].fetch_add(all as u64, Ordering::Relaxed);
     }
 
-    fn flush_all(&mut self) {
-        // Most of a flush's copies are as they were: they are told so here,
-        // from what the submission's asking found, before anything is asked
-        // and any thread woken. (Thousands of them, the heap's buffer views
-        // once a frame: on the threads, below.)
+    /// Drops refreshes known to copy nothing (`Shadow::nothing_new`) before
+    /// `ask_ahead` and `wide_each`, returning how many were dropped.
+    fn filter_nothing_new(items: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> usize {
         const FEW: usize = 256;
+        const CHUNK: usize = 64;
+        let all = items.len();
+        if all <= FEW {
+            items.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            return all - items.len();
+        }
+        let taken = std::sync::Arc::new(std::mem::take(items));
+        let keep = std::sync::Arc::new(
+            (0..all)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect::<Vec<_>>(),
+        );
+        let (taken_ref, keep_ref) = (taken.clone(), keep.clone());
+        crate::shadow::wide_each(all.div_ceil(CHUNK), move |chunk| {
+            let start = chunk * CHUNK;
+            let end = (start + CHUNK).min(taken_ref.len());
+            for idx in start..end {
+                let (shadow, from, to) = &taken_ref[idx];
+                if !shadow.nothing_new(*from, *to - *from) {
+                    keep_ref[idx].store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        let taken = std::sync::Arc::try_unwrap(taken).unwrap_or_else(|_| unreachable!());
+        *items = taken
+            .into_iter()
+            .zip(keep.iter())
+            .filter_map(|(item, k)| k.load(Ordering::Relaxed).then_some(item))
+            .collect();
+        all - items.len()
+    }
+
+    fn flush_all(&mut self) {
+        // Most of a flush's copies are as they were: filter them out here
+        // (in parallel chunks when > FEW) before `ask_ahead` or worker dispatch.
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        if light {
             let started = std::time::Instant::now();
-            let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let dropped = Self::filter_nothing_new(&mut self.refreshes);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(dropped as u64, Ordering::Relaxed);
+        }
+        if self.refreshes.is_empty() {
+            return;
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -9138,10 +9167,6 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
                     Self::update(shadow, *from, *to);
                 });
             } else {
@@ -11865,6 +11890,41 @@ mod refresh_tests {
             // A longer range was never taken whole.
             assert!(!copy.nothing_new(region, 6 * PAGE));
         }
+    }
+
+    /// Even when a flush has more than `FEW` (256) refreshes, `filter_nothing_new`
+    /// drops the unchanged ones up front so `ask_ahead` and `wide_each` only see
+    /// the ranges that actually changed.
+    #[test]
+    fn many_unchanged_refreshes_are_filtered_before_dispatch() {
+        const COUNT: usize = 300;
+        let region = title(2 * PAGE, false);
+        // SAFETY: the test's own memory.
+        unsafe { std::ptr::write_bytes(region as *mut u8, 1, 2 * PAGE) };
+        let data = memory(2 * PAGE);
+        let copy = Shadow::unbacked(region as u64, data, (2 * PAGE) as u64, false);
+        // Take the first page once so `nothing_new` is true for it.
+        copy.update(region, PAGE);
+        let mut items: Vec<(std::sync::Arc<Shadow>, usize, usize)> = (0..COUNT)
+            .map(|_| (copy.clone(), region, region + PAGE))
+            .collect();
+        // Add two ranges on the second page (never taken -> `nothing_new` is false).
+        items.push((copy.clone(), region + PAGE, region + 2 * PAGE));
+        items.push((copy.clone(), region + PAGE + 64, region + PAGE + 128));
+        // Retry `ask_once` in case another parallel test called `ask_once_end`.
+        let mut dropped = 0;
+        for _ in 0..100 {
+            crate::watch::ask_once(&[(region, region + 2 * PAGE)]);
+            let mut probe = items.clone();
+            dropped = Batch::filter_nothing_new(&mut probe);
+            crate::watch::ask_once_end();
+            if dropped == COUNT {
+                items = probe;
+                break;
+            }
+        }
+        assert_eq!(dropped, COUNT);
+        assert_eq!(items.len(), 2);
     }
 
     /// Of a copy in the card's memory only the dwords title memory changed go
