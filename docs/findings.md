@@ -232,3 +232,10 @@ Symbolizer: F:\Work\victory-runlogs\tools\symprof.py (+callees.py, callers.py) v
 - Fix 4fa0fe19 (fork-t1): list threads batch retirements thread-locally (flush per chunk / 256), keep_ref avoids AddRef when same. VICTORY_RETIRE_BATCH=0 off.
 - fork-t1-perf 9f8314d5 = fork-t1 + trustno1 PR #814 (texture refresh CPU cuts). Staged as target\release\victory.exe; fork-t1 alone saved as victory-t1-batch.exe. Untested in game.
 - Ideas not done (risky blind): keep make_listed views across recordings (cleared per recording now), skip bind for unchanged consecutive indirect calls.
+
+## GPU timing + barrier tests + new PRs (2026-11-28 afternoon)
+- GPU timing (VICTORY_GPU_TIMING=1 via victory-settings.txt, diag): 37-48 ms/frame of commands; indirect 23-31 ms in 6-8k commands (~3.5 us each), no single heavy shader (top 2.2 ms). ~690 global UAV barriers/frame for title barrier groups + 189 clamp passes with 2 each.
+- VICTORY_BARRIER_TEST=both: white screen (broken), GPU busy 58->51 at ~9k draws. =indirect: picture fine, 9k draws 13.1 -> 14.7 fps (diag vs release, noisy).
+- fork-t1-perf += trustno1 PR #923 (list upload buffers pooled), #933+#934 (kernel writes without the guards' lock): 8k 12.7->14.8, 9k 13.1->14.9 fps; seconds with a frame >120 ms 55/1056 -> 7/1054; longest new-memory wait 68 -> 12 ms.
+- 47235862: indirect clamp keeps only dst's transition after the pass (VICTORY_INDIRECT_TIGHT=0 restores). Run 15:2x pending.
+- New PRs worth a look: #927 (CARD_AWAKE off by default; we have it on), #919 (pipeline library 4.8 GB -> 25 MB), #938 (faces with only eyes/teeth).
