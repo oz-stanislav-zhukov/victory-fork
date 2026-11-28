@@ -3317,8 +3317,9 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            // The view the slot holds now, read once for the looks below.
-            let held = rest(1, || heap.handle(index).and_then(crate::descriptor::view));
+            // The view the slot holds now, read once for the whole slot turn.
+            let handle = rest(1, || heap.handle(index));
+            let held = handle.and_then(crate::descriptor::view);
             if let Some(View::Placed(false, resource, desc)) = &held {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(desc);
@@ -3375,7 +3376,7 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
+                    && handle.is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
                     outcome(slot_outcome::HELD);
@@ -3415,17 +3416,17 @@ impl State {
             let shows_other = !baking
                 && !sync_bake
                 && crate::resource::held_only()
-                && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle)));
+                && handle.is_some_and(|handle| host.texture_slot_shows_other(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !shows_other
                 && !baking
                 && !sync_bake
                 && crate::descriptor::host::show_after()
-                && rest(1, || heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle)));
+                && handle.is_some_and(|handle| !host.texture_slot_made_from(index, handle));
             let (view, bake_key) = timed(6, || {
                 if sync_bake {
-                    match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
+                    match handle.and_then(|handle| host.prepare_bake_slot(index, handle)) {
                         Some((view, key)) => (Some(view), Some(key)),
                         None => (None, None),
                     }
@@ -3434,12 +3435,12 @@ impl State {
                     // again, the views' table was asked twice a slot).
                     (held.clone(), None)
                 } else {
-                    (heap.handle(index).and_then(|handle| host.mirror(index, handle, true)), None)
+                    (handle.and_then(|handle| host.mirror(index, handle, true)), None)
                 }
             });
             // (`nothing`: the slot has nothing to bring up to date.)
             let at_once = |nothing: bool| {
-                if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
+                if (late || bake_key.is_some()) && let Some(handle) = handle {
                     HEAP_TEXTURE_NOTHING[3].fetch_add(u64::from(nothing), Ordering::Relaxed);
                     shown(0, || {
                         let _ = host.mirror(index, handle, true);
@@ -3488,20 +3489,20 @@ impl State {
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 outcome(slot_outcome::SAME);
-                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, handle) {
                     if let Some(copy) = crate::resource::host_copy(resource) {
                         sync.keep.push(copy);
                     }
                     sync.publish.push((index, handle, key));
                 } else {
-                    if shows_other && let Some(handle) = heap.handle(index) {
+                    if shows_other && let Some(handle) = handle {
                         shown(2, || {
                             let _ = host.mirror(index, handle, true);
                         });
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                        if let Some(handle) = heap.handle(index) {
+                        if let Some(handle) = handle {
                             shown(1, || host.texture_slot_show_after(list, index, handle));
                         }
                     } else {
@@ -3532,7 +3533,7 @@ impl State {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
                 rest(3, || {
-                    if let Some(handle) = heap.handle(index) {
+                    if let Some(handle) = handle {
                         host.texture_slot_show_ahead(job, index, handle);
                     }
                     if let Taken::New(job) = ahead {
@@ -3564,16 +3565,16 @@ impl State {
                 served = false;
                 break;
             }
-            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, handle) {
                 if let Some(copy) = crate::resource::host_copy(resource) {
                     sync.keep.push(copy);
                 }
                 sync.publish.push((index, handle, key));
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
+            if shows_other && let Some(handle) = handle {
                 shown(2, || host.texture_slot_flip(list, index, handle));
             }
-            if late && let Some(handle) = heap.handle(index) {
+            if late && let Some(handle) = handle {
                 shown(1, || host.texture_slot_show_after(list, index, handle));
             }
             #[cfg(feature = "diagnostics")]

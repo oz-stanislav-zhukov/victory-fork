@@ -1340,23 +1340,44 @@ impl Due {
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
+        static FRESH_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fresh_first = *FRESH_FIRST.get_or_init(|| std::env::var_os("VICTORY_DUE_FRESH_FIRST").is_some_and(|v| v == "1"));
+        self.ordered_with(max, fresh_first)
+    }
+
+    fn ordered_with(self, max: usize, fresh_first: bool) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
         fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
-        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let mut known: Vec<Option<Checked>> = Vec::with_capacity(max.min(again.len() + fresh.len()));
+        let push_fresh = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>| {
+            let (mut new, mut old) = (0, fresh.len());
+            while new < old && order.len() < max {
+                order.push((fresh[new].1, fresh[new].2));
+                known.push(None);
+                new += 1;
+                if new < old && order.len() < max {
+                    old -= 1;
+                    order.push((fresh[old].1, fresh[old].2));
+                    known.push(None);
+                }
             }
+        };
+        let push_again = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>| {
+            for &(_, index, write, checked) in again.iter().take(max.saturating_sub(order.len())) {
+                order.push((index, write));
+                known.push(checked);
+            }
+        };
+        if fresh_first {
+            push_fresh(&mut order, &mut known);
+            push_again(&mut order, &mut known);
+        } else {
+            push_again(&mut order, &mut known);
+            push_fresh(&mut order, &mut known);
         }
-        order.truncate(max);
-        known.resize(order.len(), None);
         (order, known)
     }
 }
@@ -6303,6 +6324,22 @@ mod tests {
         for at in [0, 12, 20] {
             assert_eq!(q.due_and_census(at).1, q.census(at));
         }
+    }
+
+    #[test]
+    fn due_fresh_first_prevents_again_starvation() {
+        let mut due = Due::default();
+        due.again.push((1, 100, 10, None));
+        due.again.push((2, 101, 11, None));
+        due.fresh.push((3, 200, 12));
+        let (again_first, _) = Due {
+            again: due.again.clone(),
+            fresh: due.fresh.clone(),
+        }
+        .ordered_with(2, false);
+        assert_eq!(again_first, [(101, 11), (100, 10)]);
+        let (fresh_first, _) = due.ordered_with(2, true);
+        assert_eq!(fresh_first, [(200, 12), (101, 11)]);
     }
 
     /// Slots held back for lack of room on the card are not handed out
