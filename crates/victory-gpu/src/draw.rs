@@ -3184,7 +3184,7 @@ impl State {
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let pressured = crate::residency::pressured();
-        let catchup_active = catchup && on_time >= 1024 && room && !pressured;
+        let catchup_active = catchup && on_time >= 256 && room && !pressured;
         let (per_frame, span) = if catchup_active { (per_frame * 3, span * 3) } else { (per_frame, span) };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
@@ -5993,7 +5993,11 @@ fn texspk_cap_ms(
         return base_cap_ms;
     }
     let scaled = if catchup_active {
-        base_cap_ms.saturating_mul(3)
+        if vram_budget.is_some_and(|b| b > 12 * GIB) {
+            base_cap_ms.saturating_mul(4)
+        } else {
+            base_cap_ms.saturating_mul(3)
+        }
     } else if vram_budget.is_some_and(|b| b > 12 * GIB) {
         base_cap_ms.saturating_mul(2)
     } else {
@@ -6040,9 +6044,9 @@ mod tests {
         // 12 GiB baseline keeps 8 ms when calm and scales to 24 ms on catchup.
         assert_eq!(texspk_cap_ms(8, Some(12 * GIB), true, false, false), 8);
         assert_eq!(texspk_cap_ms(8, Some(12 * GIB), true, false, true), 24);
-        // >12 GiB (e.g. 16 GiB RTX 5080) with room doubles calm cap to 16 ms, 24 ms on catchup.
+        // >12 GiB (e.g. 16 GiB RTX 5080) with room doubles calm cap to 16 ms, 32 ms on catchup.
         assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, false, false), 16);
-        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, false, true), 24);
+        assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, false, true), 32);
         // Full card or host-RAM pressure never expands the cap.
         assert_eq!(texspk_cap_ms(8, Some(16 * GIB), false, false, true), 8);
         assert_eq!(texspk_cap_ms(8, Some(16 * GIB), true, true, true), 8);

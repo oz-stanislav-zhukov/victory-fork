@@ -1365,18 +1365,27 @@ impl Due {
                 }
             }
         };
-        let push_again = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>| {
-            for &(_, index, write, checked) in again.iter().take(max.saturating_sub(order.len())) {
-                order.push((index, write));
-                known.push(checked);
+        let push_again = |order: &mut Vec<(u32, u64)>, known: &mut Vec<Option<Checked>>, recheck: Option<bool>| {
+            for &(_, index, write, checked) in &again {
+                if order.len() >= max {
+                    break;
+                }
+                if recheck.is_none_or(|want| checked.is_some() == want) {
+                    order.push((index, write));
+                    known.push(checked);
+                }
             }
         };
         if fresh_first {
             push_fresh(&mut order, &mut known);
-            push_again(&mut order, &mut known);
+            push_again(&mut order, &mut known, None);
         } else {
-            push_again(&mut order, &mut known);
+            // Unuploaded retries (`later`/`partly`) first, then `fresh`
+            // never-uploaded slots, then already-uploaded `recheck` slots so
+            // thousands of `recheck` slots cannot starve `fresh` textures.
+            push_again(&mut order, &mut known, Some(false));
             push_fresh(&mut order, &mut known);
+            push_again(&mut order, &mut known, Some(true));
         }
         (order, known)
     }
