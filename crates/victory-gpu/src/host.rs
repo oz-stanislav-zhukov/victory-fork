@@ -2522,6 +2522,117 @@ fn trim_spare_uploads() {
     }
 }
 
+#[cfg(test)]
+mod upload_pool_tests {
+    use super::*;
+
+    /// Lists' upload buffers are kept at powers of two from 64 KiB, so the
+    /// next copy of about the same size finds one; the largest are not.
+    #[test]
+    fn kept_upload_buffers_come_in_powers_of_two() {
+        assert_eq!(upload_class(1), Some(64 << 10));
+        assert_eq!(upload_class(64 << 10), Some(64 << 10));
+        assert_eq!(upload_class((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(upload_class(3 << 20), Some(4 << 20));
+        assert_eq!(upload_class(32 << 20), Some(32 << 20));
+        assert_eq!(upload_class((32 << 20) + 1), None);
+        assert_eq!(upload_class(u64::MAX), None);
+    }
+
+    /// A list that is done gives its upload buffers back, and the next
+    /// list that asks for one of that size gets one of them, mapped and
+    /// writable; one of another size is made.
+    #[test]
+    fn the_next_list_gets_the_upload_buffers_a_list_gave_back() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !upload_pool() {
+            return;
+        }
+        // A size no other test asks for: 16 MiB buffers.
+        let size = (8 << 20) + 1;
+        let first = host.new_list().unwrap();
+        let (buffer, data) = first.upload(host, size).unwrap();
+        // SAFETY: a mapped buffer of at least `size` bytes.
+        unsafe { std::ptr::write_bytes(data, 0xab, size as usize) };
+        let given = buffer.as_raw();
+        drop(buffer);
+        drop(first);
+        let second = host.new_list().unwrap();
+        let (again, data) = second.upload(host, size + 4096).unwrap();
+        assert_eq!(again.as_raw(), given, "the buffer the first list gave back");
+        // SAFETY: as above; the second list holds it.
+        unsafe { std::ptr::write_bytes(data, 0xcd, size as usize) };
+        let (other, _) = second.upload(host, size).unwrap();
+        assert_ne!(other.as_raw(), given, "one buffer, one list");
+    }
+
+    /// What a list's upload buffer costs the thread that records the copy:
+    /// made for it (upload memory, made resident; with
+    /// `VICTORY_CARD_STEPS=2` memory the card may write, made resident and
+    /// waited for until mapped), against one taken from those kept. With
+    /// `VICTORY_BENCH_BUSY=1` a thread beside it makes 64 MiB buffers all the
+    /// while, so the system pages as it does while a scene loads.
+    /// `cargo test --release -p victory-gpu --lib -- bench_list_upload_buffers --ignored --nocapture`
+    #[test]
+    #[ignore = "a bench: run it by hand"]
+    fn bench_list_upload_buffers() {
+        let Some(host) = host() else {
+            return;
+        };
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let busy = std::env::var_os("VICTORY_BENCH_BUSY").is_some_and(|v| v == "1");
+        std::thread::scope(|scope| {
+            if busy {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        drop(host.upload_buffer(64 << 20));
+                    }
+                });
+            }
+            const N: usize = 200;
+            let report = |what: &str, mut us: Vec<u64>| {
+                us.sort_unstable();
+                let mean = us.iter().sum::<u64>() as f64 / us.len() as f64;
+                println!(
+                    "{what:<44} mean {:>7.1} us  median {:>6} us  99th {:>6} us",
+                    mean,
+                    us[us.len() / 2],
+                    us[us.len() * 99 / 100]
+                );
+            };
+            for size in [64u64 << 10, 1 << 20, 8 << 20] {
+                for shared in [false, true] {
+                    let kind = if shared { "shared (CARD_STEPS=2)" } else { "upload" };
+                    let made: Vec<u64> = (0..N)
+                        .map(|_| {
+                            let began = std::time::Instant::now();
+                            let buffer = if shared { host.shared_buffer_now(size) } else { host.upload_buffer(size) };
+                            let us = began.elapsed().as_micros() as u64;
+                            drop(buffer.expect("a buffer"));
+                            us
+                        })
+                        .collect();
+                    report(&format!("{} KiB {kind}, made for each", size >> 10), made);
+                    let class = upload_class(size).unwrap();
+                    let kept: Vec<u64> = (0..N)
+                        .map(|_| {
+                            let began = std::time::Instant::now();
+                            let upload = take_upload(host, class, shared).expect("a buffer");
+                            let us = began.elapsed().as_micros() as u64;
+                            give_uploads(vec![(upload, class, shared)]);
+                            us
+                        })
+                        .collect();
+                    report(&format!("{} KiB {kind}, kept", size >> 10), kept);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -3117,20 +3228,7 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable, upload_class};
-
-    /// Lists' upload buffers are kept at powers of two from 64 KiB, so the
-    /// next copy of about the same size finds one; the largest are not.
-    #[test]
-    fn kept_upload_buffers_come_in_powers_of_two() {
-        assert_eq!(upload_class(1), Some(64 << 10));
-        assert_eq!(upload_class(64 << 10), Some(64 << 10));
-        assert_eq!(upload_class((64 << 10) + 1), Some(128 << 10));
-        assert_eq!(upload_class(3 << 20), Some(4 << 20));
-        assert_eq!(upload_class(32 << 20), Some(32 << 20));
-        assert_eq!(upload_class((32 << 20) + 1), None);
-        assert_eq!(upload_class(u64::MAX), None);
-    }
+    use super::{flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
