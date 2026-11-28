@@ -532,6 +532,12 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    // After the clamp only `dst`'s transition: a transition out of
+    // `UNORDERED_ACCESS` waits for the writes to `dst` itself, and the budget
+    // is only changed by atomics (in an order that matters only once it runs
+    // out). The wait for every shader write there cost about a tenth of the
+    // frame rate in a Series S street (189 clamps a frame, run 2026-11-28).
+    let after = if waits && !tight_after() { 0 } else { 1 };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -545,9 +551,17 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[after..]);
     }
     true
+}
+
+/// Whether a clamp's pass is followed by `dst`'s transition alone, not a wait
+/// for every earlier shader write as well (`VICTORY_INDIRECT_TIGHT=0`: both,
+/// as before).
+fn tight_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_INDIRECT_TIGHT").map_or(true, |v| v.trim() != "0"))
 }
 
 /// The batched clamp's pipeline ([`batch`]).
