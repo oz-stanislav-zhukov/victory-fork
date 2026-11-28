@@ -208,3 +208,16 @@ esearch, STOP file stops it).
 - pn: main merged into nv; perf-streaming-60fps has PRESENT_SYNC/INPLACE_CONSTANTS/FILE_CACHE (opt-in, untested).
 - fx main: RT on by default, RAY_GUIDE (README: not a gain), water light tile slots; #1451 LIGHT_REFRESH+SETTLE_ROOM still open.
 - Marvisak: #3683 pair meetings, #3679 sync_slots RwLock, #3674 sampler order - nothing urgent for NVIDIA trees.
+
+## trustno1 tuning runs 2026-11-28 (fork-t1 = nv 63b902fe + #850 + text scale)
+| setup | Golden Deck | street | GPU busy | submit busy |
+|---|---|---|---|---|
+| X 1080to1440 Balanced, FG 6x, water on | 9.7 | - | 80-88 | 66-75 |
+| X Balanced, FG 2x, water off | 16.5 | 11.8 | 53-57 / ~80 | 44 |
+| X Performance + M, FAST_CORES=1 | 21.8 (2.4k draws) | 13.1 | 41 / 65 | 34-48 |
+| **S 720->1080 Quality + M** | **20.0** | **20.0** | 45-48 | 38-40 |
+- Series S: steady 20 fps both views, no clothing flicker (X: flicker, "no free dynamic descriptor slots" only there). Posted to nv#813 (two comments).
+- 720 internal on X only took ~15 ms off GPU: most GPU work is resolution-independent.
+- P-cores 100%, E-cores ~20% under default FAST_CORES=2; =1 kept (no visible gain or loss).
+- Saves fixed by nv 879558a3 (os error 32 on old versions; something holds the files).
+- Overlay text: font::scale = height/400 (680b9212), readable in a 1000-line window.
