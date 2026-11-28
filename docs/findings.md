@@ -196,3 +196,15 @@ esearch, STOP file stops it).
 - H21 (H19 + `VICTORY_THIN_THREADS=14`): worse. Scenes >4k draws median 17.2 (H19 19.9); recording 55k calls in 348 ms (6.3 us/call vs 4.5 with 8 threads): the per-call cost is contention, not too few threads. Keep 8. Car paint still has the frosty white sheen on its lower body.
 - H20 (trustno1 main `d12eb1b2`): failed at once on Win10, every root signature with flags 0xc01 refused: the tree has no Agility SDK. Fix on `fork-t1`: the D3D12SDKVersion/D3D12SDKPath exports from fx apps/victory (+ a `format!` build fix).
 - H22 (trustno1 + Agility, Series X 1440p, DLSS, `BVH_BUILDER=1 FIRSTLANE_OWN=1`): picture clearly best so far (lit shadows, sharp, no frost). RT on, DLSS Quality: 6.5-9.3 fps, 42-96 ms on the GPU + 45-51 ms preparing (copies 18-26 ms, 60-74 MB). RT off + DLSS Balanced (F1): ~21 fps, GPU wait 6 ms, CPU at 97% on all 28 threads (first run, driver compiling in the background). Frame generation refused: Windows HAGS off. Library saved, ended normally. Launcher `Play-T1.cmd` (local): Series X 1440, DLSS Balanced, FG 3x.
+
+## Fork scan 2026-11-28 (after ~20 h)
+- trustno1 nv/main: +74 commits on our d12eb1b2 base. Taken (fork-t1 rebased, old kept as fork-t1-old-20261128):
+  879558a3 save versions that cannot be removed no longer fail the container (matches our "containers=[]" with files present),
+  8fc22547 tearing present (~+2 fps), 63b902fe Series S 540p row + memory stack on by default, own Agility exports (our port dropped),
+  own static-sampler order (pipeline/samplers.rs; fx 9e907466 is the same idea, not needed).
+- trustno1 PR #850 (t90): fewer allocations in frame preparation, shadow allocations outside the lock: cherry-picked onto fork-t1.
+- trustno1 #833: VICTORY_LATE_WAIT_LISTS=1024 cut "after the sending" 11-18 ms -> 1-4 ms on 8 cores: set in Play-T1.cmd.
+- trustno1 #855 (5090): submitting thread limits frame rate (GPU ~35%), methods 0x1c8/0x218 unimplemented - same wall as ours.
+- pn: main merged into nv; perf-streaming-60fps has PRESENT_SYNC/INPLACE_CONSTANTS/FILE_CACHE (opt-in, untested).
+- fx main: RT on by default, RAY_GUIDE (README: not a gain), water light tile slots; #1451 LIGHT_REFRESH+SETTLE_ROOM still open.
+- Marvisak: #3683 pair meetings, #3679 sync_slots RwLock, #3674 sampler order - nothing urgent for NVIDIA trees.
