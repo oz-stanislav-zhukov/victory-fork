@@ -1704,6 +1704,11 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
+    view_with_key(handle).map(|(_, view)| view)
+}
+
+/// The `(key, view)` recorded at `handle`, if one is (and its resource is alive).
+pub(crate) fn view_with_key(handle: u64) -> Option<(u64, View)> {
     if handle == 0 {
         return None;
     }
@@ -1712,7 +1717,8 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     if tag != VIEW_TAG {
         return None;
     }
-    view_at(i, generation)
+    let key = u64::from(generation) << 32 | u64::from(i);
+    view_at(i, generation).map(|view| (key, view))
 }
 
 /// A description of `N` words, if the title passes one.

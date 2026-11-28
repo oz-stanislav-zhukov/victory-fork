@@ -576,7 +576,7 @@ pub(crate) fn flip_now() {
 pub(crate) static FLIPPED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The key of the record at `handle`, a view's descriptor slot; 0: none.
-fn record_key(handle: u64) -> u64 {
+pub(crate) fn record_key(handle: u64) -> u64 {
     // SAFETY: the handle is a descriptor slot in title memory.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     if tag == VIEW_TAG { u64::from(generation) << 32 | u64::from(i) } else { 0 }
@@ -2831,34 +2831,32 @@ impl HostHeap {
     /// until then it shows what it showed. (Made at once, the frames on the
     /// card read the new view before its levels were filled.)
     pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        self.flip(list, index, handle, None);
+        self.flip(list, index, handle, record_key(handle), None);
     }
 
     /// The same of a slot that shows nothing of the texture the record at
     /// `handle` views, or something else: until then it shows the neutral
     /// texture ([`show_after`]).
     pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        if self.show_later(index, handle) {
-            self.flip(list, index, handle, Some(crate::frame::current()));
+        if let Some(key) = self.show_later(index, handle) {
+            self.flip(list, index, handle, key, Some(crate::frame::current()));
         }
     }
 
     /// What slot `index` shows until the texture the record at `handle` views
-    /// is shown. False: it shows it, or there is none.
-    fn show_later(&self, index: u32, handle: u64) -> bool {
+    /// is shown. `None`: it shows it, or there is none.
+    fn show_later(&self, index: u32, handle: u64) -> Option<u64> {
         use std::sync::atomic::Ordering::Relaxed;
         let key = record_key(handle);
         let view = view_at(key as u32, (key >> 32) as u32);
         let (true, Some(view)) = (key != 0, view) else {
-            return false;
+            return None;
         };
         let stale = {
             let _made = self.made.lock(index);
-            let Some(shown) = self.made.get(index) else {
-                return false;
-            };
+            let shown = self.made.get(index)?;
             if shown == key {
-                return false;
+                return None;
             }
             // (As `mirror`.)
             let stale = self.note_buffer(index, Some(&view), true);
@@ -2881,16 +2879,16 @@ impl HostHeap {
             stale
         };
         self.unmake_stale(index, stale);
-        true
+        Some(key)
     }
 
     /// [`HostHeap::texture_slot_show_after`] of a texture whose upload `job`
     /// makes: shown when that has run.
     pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64) {
-        if !self.show_later(index, handle) {
+        let Some(key) = self.show_later(index, handle) else {
             return;
-        }
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        };
+        let heap = std::ptr::from_ref(self) as usize;
         let late = Some(crate::frame::current());
         job.then(move || {
             let flip = Flip { after: 0, heap, index, handle, key, late };
@@ -2917,9 +2915,9 @@ impl HostHeap {
         self.mirror(index, handle, true);
     }
 
-    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
+    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64, late: Option<u64>) {
         use std::sync::atomic::Ordering::{Relaxed, Release};
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let heap = std::ptr::from_ref(self) as usize;
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
         let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
