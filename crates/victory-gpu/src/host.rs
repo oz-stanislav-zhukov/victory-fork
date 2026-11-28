@@ -6142,7 +6142,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            batch.copy_spans(runs);
+            batch.copy_spans(runs, refresh_front().then_some(&parts[..]));
             let Batch { spans, ranges, .. } = &mut batch;
             ranges.clear();
             ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
@@ -8539,6 +8539,8 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// `touches` and `due` were already gathered during [`Batch::copy_spans`].
+    front_gathered: bool,
     /// Per copy the submission refreshes, the span of all its refreshes, in
     /// the order the copies first come ([`Batch::copy_spans`]); where each
     /// copy (by address) is in it.
@@ -8794,6 +8796,7 @@ impl Batch {
         self.fills.clear();
         self.ahead.clear();
         self.front = false;
+        self.front_gathered = false;
         self.spans.clear();
         self.spans_at.clear();
         self.ranges.clear();
@@ -8805,35 +8808,59 @@ impl Batch {
     /// [`Batch::spans`]: the submission's one asking asks about those
     /// ([`crate::watch::ask_once`]), and behind flights those of copies
     /// shaders may be writing are looked at ([`Batch::stale_under_flights`]).
-    /// One walk over the steps for both, where there were two, each with a
-    /// table of its own.
-    fn copy_spans(&mut self, runs: &[&HostList]) {
+    /// When `parts` is `Some`, also gathers `touches` and `due` for
+    /// [`Batch::refresh_front`] in the same single walk.
+    fn copy_spans(&mut self, runs: &[&HostList], parts: Option<&[usize]>) {
         self.spans.clear();
         self.spans_at.clear();
+        if parts.is_some() {
+            self.touches.clear();
+            self.due.clear();
+            self.front_gathered = true;
+        }
+        let textures = parts.is_some() && wide_textures();
         // (Most come several times on end.)
         let mut last = (0, 0);
-        for list in runs {
+        for (n, list) in runs.iter().enumerate() {
+            if let Some(parts) = parts
+                && parts.contains(&n)
+            {
+                self.touches.push(Touch::Part);
+            }
             for step in &list.deferred().copies {
-                let Step::Refresh(shadow, address, len) = step else {
-                    continue;
-                };
-                let (from, to) = (*address, *address + *len);
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                let at = if last.0 == key && key != 0 {
-                    last.1
-                } else {
-                    match self.spans_at.entry(key) {
-                        std::collections::hash_map::Entry::Occupied(at) => *at.get(),
-                        std::collections::hash_map::Entry::Vacant(place) => {
-                            place.insert(self.spans.len());
-                            self.spans.push((shadow.clone(), from, to));
-                            self.spans.len() - 1
+                match step {
+                    Step::Refresh(shadow, address, len) => {
+                        let (from, to) = (*address, *address + *len);
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        if parts.is_some() {
+                            self.touches.push(Touch::Refresh(key, from, to));
+                        }
+                        let at = if last.0 == key && key != 0 {
+                            last.1
+                        } else {
+                            match self.spans_at.entry(key) {
+                                std::collections::hash_map::Entry::Occupied(at) => *at.get(),
+                                std::collections::hash_map::Entry::Vacant(place) => {
+                                    place.insert(self.spans.len());
+                                    self.spans.push((shadow.clone(), from, to));
+                                    self.spans.len() - 1
+                                }
+                            }
+                        };
+                        last = (key, at);
+                        let span = &mut self.spans[at];
+                        (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                    }
+                    Step::GpuWrite(shadow, ..) if parts.is_some() => {
+                        self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize));
+                    }
+                    Step::Texture(staging) if textures => {
+                        if self.texture_due(staging) {
+                            self.due.push(staging.clone());
                         }
                     }
-                };
-                last = (key, at);
-                let span = &mut self.spans[at];
-                (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                    _ => {}
+                }
             }
         }
     }
@@ -8920,30 +8947,10 @@ impl Batch {
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         // The copies refreshed, by address: as the submission's one asking
         // found them, or found here.
-        if self.spans.is_empty() {
-            self.copy_spans(runs);
+        if !self.front_gathered {
+            self.copy_spans(runs, Some(parts));
         }
-        let mut due = Vec::new();
-        self.touches.clear();
-        for (n, list) in runs.iter().enumerate() {
-            if parts.contains(&n) {
-                self.touches.push(Touch::Part);
-            }
-            for step in &list.deferred().copies {
-                match step {
-                    Step::Refresh(shadow, at, len) => {
-                        self.touches.push(Touch::Refresh(std::sync::Arc::as_ptr(shadow) as usize, *at, *at + *len));
-                    }
-                    Step::GpuWrite(shadow, ..) => self.touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
-                    Step::Texture(staging) if wide_textures() => {
-                        if self.texture_due(staging) {
-                            due.push(staging.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let due = std::mem::take(&mut self.due);
         let found = front_spans(self.touches.drain(..));
         let spans: Vec<_> = found
             .into_iter()
