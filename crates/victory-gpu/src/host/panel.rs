@@ -80,7 +80,7 @@ const fn size(shape: Shape, scale: u32) -> (u32, u32) {
 /// Pixels to a dot for a picture that high: a 720-line screenshot of it
 /// shows one and a third.
 fn scale(height: u32) -> u32 {
-    (height / 540).max(1)
+    super::font::scale(height)
 }
 
 /// Whether a dot of the picture of `lines` is white.

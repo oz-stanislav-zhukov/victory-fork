@@ -77,3 +77,12 @@ pub(super) fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
         _ => return None,
     })
 }
+
+/// Pixels to a dot for a picture that high (`VICTORY_TEXT_SCALE=<n>` sets it). One dot per 400
+/// lines: a 2560x1440 picture shown in a window about 1000 lines high is shrunk by 0.7, and at
+/// two pixels a dot the shrinking dropped whole rows of the letters; at three they stay readable.
+pub(super) fn scale(height: u32) -> u32 {
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| std::env::var("VICTORY_TEXT_SCALE").ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u32| (1..=8).contains(&n)));
+    set.unwrap_or((height / 400).max(1))
+}

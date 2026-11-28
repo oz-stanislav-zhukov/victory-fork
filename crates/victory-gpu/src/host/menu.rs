@@ -961,7 +961,7 @@ impl Menu {
         // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
-        let scale = (height / 540).max(1);
+        let scale = super::font::scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             std::mem::forget(self.buffers.take());
             self.buffers = Buffers::new(host, format, scale);
